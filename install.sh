@@ -2,10 +2,10 @@
 
 set -e
 
-readonly MARZHELP_REPOSITORY="https://github.com/smorad3363/marzhelp.git"
-readonly MARZHELP_BRANCH="production"
-readonly MARZHELP_RAW_BASE="https://raw.githubusercontent.com/smorad3363/marzhelp/production"
-readonly MARZHELP_DIRECTORY="/var/www/html/marzhelp"
+readonly MARZHELP_REPOSITORY="${MARZHELP_REPOSITORY:-https://github.com/smorad3363/marzhelp.git}"
+readonly MARZHELP_REF="${MARZHELP_REF:-${MARZHELP_BRANCH:-production}}"
+readonly MARZHELP_RAW_BASE="${MARZHELP_RAW_BASE:-https://raw.githubusercontent.com/smorad3363/marzhelp/${MARZHELP_REF}}"
+readonly MARZHELP_DIRECTORY="${MARZHELP_DIRECTORY:-/var/www/html/marzhelp}"
 
 # Function to read environment variables
 read_env_variable() {
@@ -211,7 +211,7 @@ check_marzhelp_config() {
 install_nginx() {
     echo -e "\033[1;34m=== Checking Nginx Installation ===\033[0m"
     
-    handle_apache_conflicts
+    handle_apache_conflicts || return 1
 
     if ! dpkg -l | grep -q "^ii  nginx"; then
         echo -e "\033[1;33mNginx is not installed. Proceeding with installation...\033[0m"
@@ -261,6 +261,10 @@ install_nginx() {
             echo -e "\033[1;31mError: Failed to configure UFW for HTTP traffic.\033[0m"
             return 1
         fi
+        if ! ufw allow 88/tcp; then
+            echo -e "\033[1;31mError: Failed to configure UFW for MarzHelp traffic.\033[0m"
+            return 1
+        fi
 
         # Handle conflicts with Apache (if defined)
         if declare -f handle_apache_conflicts > /dev/null; then
@@ -276,33 +280,17 @@ install_nginx() {
 }
 
 
-# Function to handle conflicts with Apache and ensure Nginx runs alone on port 80
+# Refuse to modify an existing Apache deployment automatically.
 handle_apache_conflicts() {
     echo -e "\033[1;34mChecking for Apache conflicts...\033[0m"
 
     if systemctl is-active --quiet apache2; then
-        echo -e "\033[1;31mApache is running. Stopping Apache...\033[0m"
-        
-        systemctl stop apache2
-        
-        if systemctl is-active --quiet apache2; then
-            echo -e "\033[1;31mApache did not stop correctly. Forcing shutdown...\033[0m"
-            pkill -9 apache2  
-            sleep 2  
-        fi
-
-        systemctl disable apache2
-    else
-        echo -e "\033[1;32mApache is not running.\033[0m"
+        echo -e "\033[1;31mApache is active. MarzHelp will not stop or remove it automatically.\033[0m"
+        echo "Move the existing site or configure a reverse proxy, then run the installer again."
+        return 1
     fi
 
-    if lsof -i :80 | grep -q 'apache2'; then
-        echo -e "\033[1;31mPort 80 is still in use by Apache. Killing processes...\033[0m"
-        pkill -9 apache2
-        sleep 2
-    else
-        echo -e "\033[1;32mPort 80 is free.\033[0m"
-    fi
+    echo -e "\033[1;32mNo active Apache conflict was found.\033[0m"
 }
 
 
@@ -382,7 +370,7 @@ edit_domain_ip() {
 }
 
 configure_nginx_ssl() {
-    handle_apache_conflicts
+    handle_apache_conflicts || return 1
 
     # Check if SSL certificate already exists
     if [ -f "/etc/letsencrypt/live/$botDomain/fullchain.pem" ]; then
@@ -409,8 +397,7 @@ configure_nginx_ssl() {
         echo "SSL certificate obtained successfully."
     fi
 
-    # Proceed with Nginx configuration
-    echo "Configuring Nginx to run on port 88 with SSL..."
+    echo "Configuring an isolated Nginx site on port 88..."
 
     # Detect installed PHP version
     php_version=$(php -v | grep -oP '^PHP \K[0-9]+\.[0-9]+' | head -1)
@@ -420,26 +407,34 @@ configure_nginx_ssl() {
     fi
     echo "Detected PHP version: $php_version"
 
-    # Modify Nginx configuration to listen on port 88 with SSL enabled
-    sed -i 's/listen 80 default_server;/listen 88 ssl default_server;/' /etc/nginx/sites-available/default
-    sed -i 's/listen \[::\]:80 default_server;/listen \[::\]:88 ssl default_server;/' /etc/nginx/sites-available/default
+    cat > /etc/nginx/sites-available/marzhelp <<EOF
+server {
+    listen 88 ssl;
+    listen [::]:88 ssl;
+    server_name ${botDomain};
+    root /var/www/html;
+    index index.php;
 
-    # Remove existing SSL configuration to avoid duplication
-    sed -i '/ssl_certificate /d' /etc/nginx/sites-available/default
-    sed -i '/ssl_certificate_key /d' /etc/nginx/sites-available/default
-    sed -i '/ssl_protocols /d' /etc/nginx/sites-available/default
-    sed -i '/ssl_ciphers /d' /etc/nginx/sites-available/default
+    ssl_certificate /etc/letsencrypt/live/${botDomain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${botDomain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
 
-    # Add the SSL configuration and PHP handler after the listen directive
-    sudo sed -i "/listen \[::\]:88 ssl default_server;/a \
-ssl_certificate /etc/letsencrypt/live/$botDomain/fullchain.pem;\n\
-ssl_certificate_key /etc/letsencrypt/live/$botDomain/privkey.pem;\n\
-ssl_protocols TLSv1.2 TLSv1.3;\n\
-ssl_ciphers HIGH:!aNULL:!MD5;\n\
-location ~ \.php$ {\n\
-    include snippets/fastcgi-php.conf;\n\
-    fastcgi_pass unix:/var/run/php/php${php_version}-fpm.sock;\n\
-}" /etc/nginx/sites-available/default
+    location /marzhelp/ {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ ^/marzhelp/(?:config(?:\\.local)?\\.php|.*\\.(?:json|log|txt|sql))\$ {
+        deny all;
+    }
+
+    location ~ ^/marzhelp/.*\\.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php${php_version}-fpm.sock;
+    }
+}
+EOF
+    ln -sfn /etc/nginx/sites-available/marzhelp /etc/nginx/sites-enabled/marzhelp
+    nginx -t
 
     # Restart Nginx to apply the changes
     systemctl restart nginx
@@ -550,19 +545,7 @@ install_php_packages() {
         fi
     done
 
-    # Check if Apache is installed and active, then disable it
-if dpkg -l | grep -q "^ii  apache2"; then
-    if systemctl is-active --quiet apache2; then
-        echo -e "\033[1;33mApache detected and running. Disabling...\033[0m"
-        systemctl stop apache2
-        systemctl disable apache2
-    else
-        echo -e "\033[1;32mApache is installed but not running. No action needed.\033[0m"
-    fi
-    apt remove --purge -y apache2
-else
-    echo -e "\033[1;32mApache is not installed. Skipping...\033[0m"
-fi
+    handle_apache_conflicts || return 1
 }
 install_marzhelp() {
 
@@ -572,7 +555,7 @@ install_marzhelp() {
         updater=$(mktemp)
         curl -fsSL "$MARZHELP_RAW_BASE/update.sh" -o "$updater"
         chmod 700 "$updater"
-        bash "$updater"
+        env MARZHELP_REF="$MARZHELP_REF" bash "$updater"
         rm -f "$updater"
         return
     fi
@@ -598,58 +581,75 @@ install_marzhelp() {
         echo "Error: Required values (MYSQL_ROOT_PASSWORD, botToken, allowedUsers, botDomain, serverIP, or adminID) are not set. Exiting."
         exit 1
     fi
+    if [[ ! "$allowedUsers" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]]; then
+        echo "Error: Telegram admin IDs must be a comma-separated list of numbers."
+        exit 1
+    fi
+    if [[ ! "$botDomain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "Error: Invalid bot domain."
+        exit 1
+    fi
+    if [[ ! "$serverIP" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        echo "Error: Invalid server IP address."
+        exit 1
+    fi
+    if [[ ! "$botToken" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo "Error: Invalid Telegram bot token format."
+        exit 1
+    fi
 
     vpnDbName="marzban"
+    appDbUser="marzhelp_app"
+    migrationDbUser="marzhelp_migrate"
+    appDbPassword="$(openssl rand -hex 24)"
+    migrationDbPassword="$(openssl rand -hex 24)"
+    webhookSecret="$(openssl rand -hex 32)"
 
-    # Create database if it doesn't exist
-    mysql -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS marzhelp;"
+    mysql -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" <<EOF
+CREATE DATABASE IF NOT EXISTS marzhelp
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-    # Create the user_deletions table in the Marzban database
-    mysql -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" "$vpnDbName" <<EOF
-CREATE TABLE IF NOT EXISTS user_deletions (
-  user_id int DEFAULT NULL,
-  admin_id int DEFAULT NULL,
-  deleted_at timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  used_traffic bigint DEFAULT NULL,
-  reseted_usage bigint DEFAULT NULL
-);
+CREATE USER IF NOT EXISTS '${appDbUser}'@'localhost' IDENTIFIED BY '${appDbPassword}';
+ALTER USER '${appDbUser}'@'localhost' IDENTIFIED BY '${appDbPassword}';
+GRANT SELECT, INSERT, UPDATE, DELETE ON marzhelp.* TO '${appDbUser}'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON ${vpnDbName}.* TO '${appDbUser}'@'localhost';
+
+CREATE USER IF NOT EXISTS '${migrationDbUser}'@'localhost' IDENTIFIED BY '${migrationDbPassword}';
+ALTER USER '${migrationDbUser}'@'localhost' IDENTIFIED BY '${migrationDbPassword}';
+GRANT ALL PRIVILEGES ON marzhelp.* TO '${migrationDbUser}'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, TRIGGER, EVENT, REFERENCES
+  ON ${vpnDbName}.* TO '${migrationDbUser}'@'localhost';
+SET GLOBAL event_scheduler = ON;
+FLUSH PRIVILEGES;
 EOF
 
-    # Remove any existing Marzhelp directory from /var/www/html
+    # Preserve an incomplete installation instead of deleting it.
     if [ -d "/var/www/html/marzhelp" ]; then
-        rm -rf /var/www/html/marzhelp
+        partial_backup="/var/backups/marzhelp/preinstall-$(date -u +%Y%m%dT%H%M%SZ)"
+        install -d -m 700 /var/backups/marzhelp
+        mv /var/www/html/marzhelp "$partial_backup"
+        echo "Incomplete installation preserved at $partial_backup"
     fi
 
     echo "Cloning Marzhelp repository from GitHub..."
-    git clone --branch "$MARZHELP_BRANCH" --single-branch "$MARZHELP_REPOSITORY" /var/www/html/marzhelp
+    git clone --branch "$MARZHELP_REF" --single-branch "$MARZHELP_REPOSITORY" /var/www/html/marzhelp
 
-    # Define commands and permissions to apply
-    commands=(
-        "sudo chown -R www-data:www-data /var/www/html/marzhelp/"
-        "sudo chmod -R 755 /var/www/html/marzhelp/"
-        "sudo install -d -o www-data -g www-data -m 700 /var/backups/marzhelp"
-        "sudo chown www-data:www-data /usr/local/bin/marzban"
-        "sudo chmod +x /usr/local/bin/marzban"
-        "sudo chmod +x /usr/bin/crontab"
-        "sudo chmod +x /usr/bin/wget"
-    )
+    install -d -o www-data -g www-data -m 750 /var/lib/marzhelp
+    install -d -o root -g root -m 700 /var/backups/marzhelp
+    install -d -o root -g root -m 755 /etc/mysql/conf.d
+    cat > /etc/mysql/conf.d/marzhelp.cnf <<'EOF'
+[mysqld]
+event_scheduler=ON
+EOF
+    chmod 644 /etc/mysql/conf.d/marzhelp.cnf
+    rm -f /etc/sudoers.d/marzhelp
 
-    # Loop over each command and execute
-    for cmd in "${commands[@]}"; do
-        echo "Executing: $cmd"
-        eval "$cmd"
-    done
-
-    # Add www-data to sudoers for Marzhelp commands
-    permissions=(
-    "www-data ALL=(ALL) NOPASSWD: /usr/local/bin/marzban"
-    "www-data ALL=(ALL) NOPASSWD: /usr/bin/crontab"
-    "www-data ALL=(ALL) NOPASSWD: /usr/bin/wget"
-        )
-
-    for prm in "${permissions[@]}"; do
-    sudo bash -c "grep -qxF '$prm' /etc/sudoers.d/marzhelp || echo '$prm' >> /etc/sudoers.d/marzhelp"
-    done
+    chown -R root:www-data /var/www/html/marzhelp
+    find /var/www/html/marzhelp -type d -exec chmod 750 {} \;
+    find /var/www/html/marzhelp -type f -exec chmod 640 {} \;
+    chmod 750 /var/www/html/marzhelp/bootstrap.sh \
+              /var/www/html/marzhelp/install.sh \
+              /var/www/html/marzhelp/update.sh
 
     # Write the config.php file with bot token and database credentials
     cat <<EOL > /var/www/html/marzhelp/config.php
@@ -657,24 +657,32 @@ EOF
 \$botToken = '$botToken';
 \$apiURL = "https://api.telegram.org/bot\$botToken/";
 \$botdomain = '$botDomain';
+\$webhookSecret = '$webhookSecret';
+\$allowSystemCommands = false;
+\$storagePath = '/var/lib/marzhelp';
 
 \$allowedUsers = [$allowedUsers];
 
-\$botDbHost = '127.0.0.1';
-\$botDbUser = 'root';
-\$botDbPass = '$MYSQL_ROOT_PASSWORD';
+\$botDbHost = 'localhost';
+\$botDbUser = '$appDbUser';
+\$botDbPass = '$appDbPassword';
 \$botDbName = 'marzhelp';
 
-\$vpnDbHost = '127.0.0.1'; 
-\$vpnDbUser = 'root';
-\$vpnDbPass = '$MYSQL_ROOT_PASSWORD';
+\$vpnDbHost = 'localhost';
+\$vpnDbUser = '$appDbUser';
+\$vpnDbPass = '$appDbPassword';
 \$vpnDbName = '$vpnDbName';
+
+\$migrationDbUser = '$migrationDbUser';
+\$migrationDbPass = '$migrationDbPassword';
 
 \$marzbanUrl = 'https://your-marzban-server.com'; 
 \$marzbanAdminUsername = 'your_admin_username';  
 \$marzbanAdminPassword = 'your_admin_password';  
 ?>
 EOL
+    chown root:www-data /var/www/html/marzhelp/config.php
+    chmod 640 /var/www/html/marzhelp/config.php
 
     # Execute table.php if it exists
     if [ -f "/var/www/html/marzhelp/table.php" ]; then
@@ -684,9 +692,23 @@ EOL
         echo "table.php not found."
     fi
 
-    # Set webhook for the bot using the domain and IP
-    curl "https://api.telegram.org/bot$botToken/deleteWebhook"
-    curl "https://api.telegram.org/bot$botToken/setWebhook?url=https://$botDomain:88/marzhelp/webhook.php&ip_address=$serverIP&max_connections=40"
+    ufw allow 88/tcp
+
+    # Set and verify the authenticated webhook.
+    curl -fsS -X POST "https://api.telegram.org/bot$botToken/deleteWebhook" >/dev/null
+    webhook_response="$(
+        curl -fsS -X POST "https://api.telegram.org/bot$botToken/setWebhook" \
+            --data-urlencode "url=https://$botDomain:88/marzhelp/webhook.php" \
+            --data-urlencode "ip_address=$serverIP" \
+            --data-urlencode "max_connections=40" \
+            --data-urlencode "secret_token=$webhookSecret"
+    )"
+    if [[ "$webhook_response" != *'"ok":true'* ]]; then
+        echo "Error: Telegram rejected the webhook configuration: $webhook_response"
+        exit 1
+    fi
+
+    sed -i '/^MYSQL_ROOT_PASSWORD=/d' "$config_file"
 
     # Restart Nginx to apply changes
     systemctl restart nginx
@@ -717,11 +739,10 @@ uninstall_marzhelp() {
         display_message "1;31" "Error: Marzhelp directory not found."
     fi
 
-    display_message "1;33" "Removing Nginx..."
-    if sudo apt remove --purge -y nginx nginx-common; then
-        display_message "1;32" "Nginx removed successfully."
-    else
-        display_message "1;31" "Error: Failed to remove Nginx."
+    rm -f /etc/nginx/sites-enabled/marzhelp
+    rm -f /etc/nginx/sites-available/marzhelp
+    if command -v nginx >/dev/null 2>&1 && nginx -t; then
+        systemctl reload nginx
     fi
 
     display_message "1;32" "Marzhelp uninstallation completed."
@@ -776,8 +797,8 @@ main() {
             5) install_php_packages ;;
             6) install_marzhelp ;;
             7) remove_nginx ;;
-            8) curl -Ls https://github.com/Mmdd93/v2ray-assistance/raw/refs/heads/main/nginx.sh -o nginx.sh; sudo bash nginx.sh ;;
-            9) curl -Ls https://raw.githubusercontent.com/Mmdd93/v2ray-assistance/main/ufw.sh -o ufw.sh; sudo bash ufw.sh ;;
+            8) echo "Nginx is managed through /etc/nginx/sites-available/marzhelp." ;;
+            9) ufw status verbose ;;
             10) install_nginx; install_php_packages; configure_nginx_ssl; install_marzhelp ;;
             11) uninstall_marzhelp ;;   # New case for uninstalling Marzhelp
             0) echo "Exiting..."; exit 0 ;;

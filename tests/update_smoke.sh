@@ -65,12 +65,22 @@ if [[ "${1:-}" == "-r" ]]; then
         botDbPass|vpnDbPass) printf 'secret' ;;
         botDbName) printf 'marzhelp' ;;
         vpnDbName) printf 'marzban' ;;
-        *) exit 1 ;;
+        botToken) printf 'test-token' ;;
+        botdomain) printf 'example.invalid' ;;
+        migrationDbUser|migrationDbPass) ;;
+        *)
+            case "${2:-}" in
+                *webhookSecret*|*migrationDbUser*|*migrationDbPass*) ;;
+                *) exit 1 ;;
+            esac
+            ;;
     esac
 elif [[ "${1:-}" == "-l" ]]; then
     exit 0
 elif [[ "${1:-}" == */table.php ]]; then
     : > "$TEST_TABLE_MARKER"
+elif [[ "${1:-}" == */app/scrub_config.php ]]; then
+    sed -i 's/secret//g' "${2}"
 else
     exit 1
 fi
@@ -79,10 +89,23 @@ cat > "${mock_bin}/mysqldump" <<'MOCKDUMP'
 #!/usr/bin/env bash
 printf '%s\n' '-- mock database dump'
 MOCKDUMP
-chmod +x "${mock_bin}/php" "${mock_bin}/mysqldump"
+cat > "${mock_bin}/mysql" <<'MOCKMYSQL'
+#!/usr/bin/env bash
+cat >/dev/null
+MOCKMYSQL
+cat > "${mock_bin}/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+printf '%s\n' '{"ok":true}'
+MOCKCURL
+chmod +x \
+    "${mock_bin}/php" \
+    "${mock_bin}/mysqldump" \
+    "${mock_bin}/mysql" \
+    "${mock_bin}/curl"
 
 PATH="${mock_bin}:${PATH}" \
 TEST_TABLE_MARKER="$table_marker" \
+MARZHELP_ALLOW_UNPRIVILEGED=1 \
 MARZHELP_REPOSITORY="$target_remote" \
 MARZHELP_BRANCH="production" \
 MARZHELP_DIRECTORY="$installed_directory" \
@@ -92,7 +115,10 @@ bash "${PROJECT_ROOT}/update.sh"
 [[ -f "${installed_directory}/release.txt" ]]
 [[ ! -f "${installed_directory}/old-release.txt" ]]
 [[ -f "$table_marker" ]]
-[[ "$(git hash-object "${installed_directory}/config.php")" == "$config_hash_before" ]]
+[[ "$(git hash-object "${installed_directory}/config.php")" != "$config_hash_before" ]]
+grep -q "botDbPass = '';" "${installed_directory}/config.php"
+grep -q "vpnDbPass = '';" "${installed_directory}/config.php"
+[[ -f "${installed_directory}/config.local.php" ]]
 [[ "$(git -C "$installed_directory" remote get-url origin)" == *"/target.git" ]]
 [[ -x "${installed_directory}/update.sh" ]]
 find "$backup_directory" -name marzhelp.sql -type f -size +0c | grep -q .

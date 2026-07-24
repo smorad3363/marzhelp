@@ -1,7 +1,21 @@
 <?php
 date_default_timezone_set('Asia/Tehran');
 
-require __DIR__ . '/../config.php';
+require __DIR__ . '/../app/bootstrap.php';
+
+$runtimeStoragePath = $storagePath ?? (__DIR__ . '/../storage');
+if (is_dir($runtimeStoragePath) && is_writable($runtimeStoragePath)) {
+    chdir($runtimeStoragePath);
+}
+
+$cronLock = fopen(sys_get_temp_dir() . '/marzhelp-cron.lock', 'c');
+if ($cronLock === false || !flock($cronLock, LOCK_EX | LOCK_NB)) {
+    exit(0);
+}
+register_shutdown_function(static function () use ($cronLock): void {
+    flock($cronLock, LOCK_UN);
+    fclose($cronLock);
+});
 
 class Database {
     private static $instances = [];
@@ -229,8 +243,9 @@ class PanelManager {
                     IFNULL((SELECT SUM(users.used_traffic) FROM users WHERE users.admin_id = admins.id), 0) +
                     IFNULL((SELECT SUM(user_usage_logs.used_traffic_at_reset) FROM user_usage_logs 
                             WHERE user_usage_logs.user_id IN (SELECT id FROM users WHERE users.admin_id = admins.id)), 0) +
-                    IFNULL((SELECT SUM(user_deletions.used_traffic) + SUM(user_deletions.reseted_usage) 
-                            FROM user_deletions WHERE user_deletions.admin_id = admins.id), 0)
+                    IFNULL((SELECT SUM(marzhelp_deleted_users.used_traffic_total)
+                            FROM marzhelp_deleted_users
+                            WHERE marzhelp_deleted_users.admin_id = admins.id), 0)
                 ) / 1073741824 AS used_traffic_gb
                 FROM admins WHERE admins.id = ?");
         } else { 
@@ -242,9 +257,21 @@ class PanelManager {
                             ELSE users.used_traffic 
                         END
                     ) FROM users WHERE users.admin_id = admins.id), 0) +
-                    IFNULL((SELECT SUM(user_usage_logs.used_traffic_at_reset) FROM user_usage_logs 
-                            WHERE user_usage_logs.user_id IN (SELECT id FROM users WHERE users.admin_id = admins.id)), 0) +
-                    IFNULL((SELECT SUM(user_deletions.reseted_usage) FROM user_deletions WHERE user_deletions.admin_id = admins.id), 0)
+                    IFNULL((
+                        SELECT SUM(user_usage_logs.used_traffic_at_reset)
+                        FROM user_usage_logs
+                        INNER JOIN users ON users.id = user_usage_logs.user_id
+                        WHERE users.admin_id = admins.id
+                          AND users.data_limit IS NULL
+                    ), 0) +
+                    IFNULL((
+                        SELECT SUM(COALESCE(
+                            marzhelp_deleted_users.allocated_traffic,
+                            marzhelp_deleted_users.used_traffic_total
+                        ))
+                        FROM marzhelp_deleted_users
+                        WHERE marzhelp_deleted_users.admin_id = admins.id
+                    ), 0)
                 ) / 1073741824 AS created_traffic_gb
                 FROM admins WHERE admins.id = ?");
         }
@@ -274,7 +301,14 @@ class PanelManager {
             SELECT COUNT(*) AS total_users,
                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
                    SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired_users,
-                   SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, online_at, NOW()) <= 5 THEN 1 ELSE 0 END) AS online_users
+                   SUM(
+                       CASE
+                           WHEN online_at IS NOT NULL
+                            AND online_at >= NOW() - INTERVAL 5 MINUTE
+                            AND online_at <= NOW() + INTERVAL 1 MINUTE
+                           THEN 1 ELSE 0
+                       END
+                   ) AS online_users
             FROM users WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
@@ -361,8 +395,9 @@ class PanelManager {
                     IFNULL((SELECT SUM(users.used_traffic) FROM users WHERE users.admin_id = admins.id), 0) +
                     IFNULL((SELECT SUM(user_usage_logs.used_traffic_at_reset) FROM user_usage_logs 
                             WHERE user_usage_logs.user_id IN (SELECT id FROM users WHERE users.admin_id = admins.id)), 0) +
-                    IFNULL((SELECT SUM(user_deletions.used_traffic) + SUM(user_deletions.reseted_usage) 
-                            FROM user_deletions WHERE user_deletions.admin_id = admins.id), 0)
+                    IFNULL((SELECT SUM(marzhelp_deleted_users.used_traffic_total)
+                            FROM marzhelp_deleted_users
+                            WHERE marzhelp_deleted_users.admin_id = admins.id), 0)
                 ) / 1073741824 AS used_traffic_gb
                 FROM admins
                 WHERE admins.id = ?
@@ -385,15 +420,20 @@ class PanelManager {
                 (
                     SELECT IFNULL(SUM(user_usage_logs.used_traffic_at_reset), 0)
                     FROM user_usage_logs
-                    WHERE user_usage_logs.user_id IN (
-                        SELECT id FROM users WHERE users.admin_id = admins.id
-                    )
+                    INNER JOIN users ON users.id = user_usage_logs.user_id
+                    WHERE users.admin_id = admins.id
+                      AND users.data_limit IS NULL
                 )
                 +
                 (
-                    SELECT IFNULL(SUM(user_deletions.reseted_usage), 0)
-                    FROM user_deletions
-                    WHERE user_deletions.admin_id = admins.id
+                    SELECT IFNULL(SUM(
+                        COALESCE(
+                            marzhelp_deleted_users.allocated_traffic,
+                            marzhelp_deleted_users.used_traffic_total
+                        )
+                    ), 0)
+                    FROM marzhelp_deleted_users
+                    WHERE marzhelp_deleted_users.admin_id = admins.id
                 )
             ) / 1073741824 AS created_traffic_gb
             FROM admins
@@ -423,7 +463,14 @@ class PanelManager {
                 COUNT(*) AS total_users,
                 SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
                 SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired_users,
-                SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, NOW(), online_at) <= 5 THEN 1 ELSE 0 END) AS online_users
+                SUM(
+                    CASE
+                        WHEN online_at IS NOT NULL
+                         AND online_at >= NOW() - INTERVAL 5 MINUTE
+                         AND online_at <= NOW() + INTERVAL 1 MINUTE
+                        THEN 1 ELSE 0
+                    END
+                ) AS online_users
             FROM users
             WHERE admin_id = ?");
         $stmtUserStats->bind_param("i", $adminId);
@@ -433,7 +480,7 @@ class PanelManager {
         $stmtUserStats->close();
     
         $userLimit = $settings['user_limit'] ?? self::INFINITY;
-        $remainingUserLimit = $userLimit !== self::INFINITY ? $userLimit - $userStats['active_users'] : self::INFINITY;
+        $remainingUserLimit = $userLimit !== self::INFINITY ? $userLimit - $userStats['total_users'] : self::INFINITY;
     
         $preventUserCreation = $this->triggerCheck('prevent_user_creation', $adminId);
         $preventUserReset = $this->triggerCheck('prevent_User_Reset_Usage', $adminId);
@@ -817,7 +864,6 @@ class PanelManager {
             $stmt->execute();
             $stmt->close();
     
-            $this->manageCreatedTrafficTrigger($adminId); 
         } elseif ($remainingTraffic > 0 && $currentStatus['data'] === 'exhausted') {
             $currentStatus['data'] = 'active';
             $newStatus = json_encode($currentStatus);
@@ -826,11 +872,105 @@ class PanelManager {
             $stmt->execute();
             $stmt->close();
     
-            $this->dropTriggerIfExists('user_creation_traffic');
-            $this->dropTriggerIfExists('user_update_traffic');
         }
     
         return $remainingTraffic;
+    }
+
+    private function syncAdminEnforcement($adminId, $adminInfo) {
+        $statement = $this->dbBot->getConnection()->prepare(
+            "SELECT
+                user_limit,
+                total_traffic,
+                calculate_volume,
+                prevent_user_creation,
+                prevent_user_deletion,
+                prevent_user_reset,
+                prevent_revoke_subscription,
+                prevent_unlimited_traffic
+             FROM admin_settings
+             WHERE admin_id = ?"
+        );
+        $statement->bind_param("i", $adminId);
+        $statement->execute();
+        $settings = $statement->get_result()->fetch_assoc();
+        $statement->close();
+
+        if (!$settings) {
+            $delete = $this->dbMarzban->getConnection()->prepare(
+                "DELETE FROM marzhelp_admin_enforcement WHERE admin_id = ?"
+            );
+            $delete->bind_param("i", $adminId);
+            $delete->execute();
+            $delete->close();
+            return;
+        }
+
+        $userLimit = (
+            $settings['user_limit'] !== null
+            && (int)$settings['user_limit'] > 0
+        ) ? (int)$settings['user_limit'] : null;
+        $trafficLimit = (
+            $settings['total_traffic'] !== null
+            && (int)$settings['total_traffic'] > 0
+        ) ? (int)$settings['total_traffic'] : null;
+        $trafficMode = $settings['calculate_volume'] === 'created_traffic'
+            ? 'created_traffic'
+            : 'used_traffic';
+        $trafficExhausted = (
+            $trafficLimit !== null
+            && is_numeric($adminInfo['remainingTraffic'])
+            && (float)$adminInfo['remainingTraffic'] <= 0
+        ) ? 1 : 0;
+        $accountExpired = (
+            $adminInfo['expiryDate'] !== self::INFINITY
+            && strtotime($adminInfo['expiryDate']) < strtotime('tomorrow')
+        ) ? 1 : 0;
+
+        $upsert = $this->dbMarzban->getConnection()->prepare(
+            "INSERT INTO marzhelp_admin_enforcement
+                (
+                    admin_id,
+                    user_limit,
+                    traffic_limit,
+                    traffic_mode,
+                    traffic_exhausted,
+                    account_expired,
+                    prevent_user_creation,
+                    prevent_user_deletion,
+                    prevent_user_reset,
+                    prevent_revoke_subscription,
+                    prevent_unlimited_traffic
+                )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                user_limit = VALUES(user_limit),
+                traffic_limit = VALUES(traffic_limit),
+                traffic_mode = VALUES(traffic_mode),
+                traffic_exhausted = VALUES(traffic_exhausted),
+                account_expired = VALUES(account_expired),
+                prevent_user_creation = VALUES(prevent_user_creation),
+                prevent_user_deletion = VALUES(prevent_user_deletion),
+                prevent_user_reset = VALUES(prevent_user_reset),
+                prevent_revoke_subscription = VALUES(prevent_revoke_subscription),
+                prevent_unlimited_traffic = VALUES(prevent_unlimited_traffic)"
+        );
+        $upsert->bind_param(
+            "iiisiiiiiii",
+            $adminId,
+            $userLimit,
+            $trafficLimit,
+            $trafficMode,
+            $trafficExhausted,
+            $accountExpired,
+            $settings['prevent_user_creation'],
+            $settings['prevent_user_deletion'],
+            $settings['prevent_user_reset'],
+            $settings['prevent_revoke_subscription'],
+            $settings['prevent_unlimited_traffic']
+        );
+        $upsert->execute();
+        $upsert->close();
     }
 
     private function notifyAdmins() {
@@ -1042,8 +1182,6 @@ class PanelManager {
         $adminsResult = $this->dbMarzban->getConnection()->query("SELECT id FROM admins");
         if (!$adminsResult) return;
 
-        $this->ensureMarzbanAdminIsSudo($marzbanAdminUsername);
-
         $allAdmins = [];
         while ($admin = $adminsResult->fetch_assoc()) {
             $allAdmins[] = $admin;
@@ -1057,8 +1195,7 @@ class PanelManager {
         
             $this->managePanelExtension($adminId, $adminInfo);
             $this->manageTrafficUsage($adminId, $adminInfo);
-            $this->manageUserLimitTrigger($adminId);
-            $this->manageCreatedTrafficTrigger($adminId);
+            $this->syncAdminEnforcement($adminId, $adminInfo);
 
             if ($currentTime === '00:00') {
                 $stmt = $this->dbMarzban->getConnection()->prepare("SELECT telegram_id, username FROM admins WHERE id = ?");
@@ -1073,8 +1210,8 @@ class PanelManager {
                     if (!empty($telegramId)) {
                         $userLimit = isset($adminInfo['userLimit']) && $adminInfo['userLimit'] !== self::INFINITY ? (int)$adminInfo['userLimit'] : 0;
                         if ($userLimit > 0) {
-                             $activeUsers = isset($adminInfo['userStats']['active_users']) ? (int)$adminInfo['userStats']['active_users'] : 0;
-                            $remainingSlots = $userLimit - $activeUsers;
+                            $totalUsers = isset($adminInfo['userStats']['total_users']) ? (int)$adminInfo['userStats']['total_users'] : 0;
+                            $remainingSlots = $userLimit - $totalUsers;
         
                             if ($remainingSlots > 0 && $remainingSlots <= 5) {
                                 $lang = $this->getLang($telegramId);
@@ -1087,9 +1224,22 @@ class PanelManager {
                 $stmt->close();
             }
         }
+
+        $this->dbMarzban->getConnection()->query(
+            "DELETE enforcement
+             FROM marzhelp_admin_enforcement enforcement
+             LEFT JOIN admins ON admins.id = enforcement.admin_id
+             WHERE admins.id IS NULL"
+        );
     
-        $this->createTrafficTriggers();
         $this->notifyAdmins();
+
+        if ($currentTime === '03:05') {
+            $this->dbBot->getConnection()->query(
+                "DELETE FROM admin_usage
+                 WHERE created_at < NOW() - INTERVAL 400 DAY"
+            );
+        }
     
         if ($currentMinute % 15 === 0) {
             foreach ($allAdmins as $admin) {

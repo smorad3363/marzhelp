@@ -1,7 +1,7 @@
 <?php
 
-ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
+ini_set('display_errors', 0);
+ini_set('display_startup_errors', 0);
 error_reporting(E_ALL);
 date_default_timezone_set('Asia/Tehran');
 
@@ -14,7 +14,13 @@ if (php_sapi_name() !== 'cli') {
 
 require_once 'app/classes/marzban.php';
 require_once 'app/functions/keyboards.php';
-require 'config.php';
+require_once 'app/security.php';
+require_once 'app/bootstrap.php';
+
+$runtimeStoragePath = $storagePath ?? (__DIR__ . '/storage');
+if (is_dir($runtimeStoragePath) && is_writable($runtimeStoragePath)) {
+    chdir($runtimeStoragePath);
+}
 
 $latestVersion = 'v0.2.8';
 
@@ -352,6 +358,24 @@ function manageEventBasedOnLimits($interval = 1) {
     global $marzbanConn;
     logDebug("manageEventBasedOnLimits called with interval: $interval");
 
+    $allowedIntervals = [1, 3, 5, 10, 30, 60];
+    $interval = (int)$interval;
+    if (!in_array($interval, $allowedIntervals, true)) {
+        $interval = 10;
+    }
+
+    $settingName = 'inbound_sync_interval';
+    $statement = $marzbanConn->prepare(
+        "INSERT INTO marzhelp_runtime_settings (setting_name, setting_value)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)"
+    );
+    $settingValue = (string)$interval;
+    $statement->bind_param('ss', $settingName, $settingValue);
+    $statement->execute();
+    $statement->close();
+    return;
+
     $eventName = 'manage_inbound_limits';
     $countResult = $marzbanConn->query("SELECT COUNT(*) as count FROM marzhelp_limits");
     if (!$countResult) {
@@ -442,7 +466,21 @@ function getAdminInfo($adminId) {
     $adminUsername = $admin['username'];
     $stmtAdmin->close();
 
-    $stmtSettings = $botConn->prepare("SELECT total_traffic, expiry_date, status, user_limit, calculate_volume FROM admin_settings WHERE admin_id = ?");
+    $stmtSettings = $botConn->prepare(
+        "SELECT
+            total_traffic,
+            expiry_date,
+            status,
+            user_limit,
+            calculate_volume,
+            prevent_user_creation,
+            prevent_user_deletion,
+            prevent_user_reset,
+            prevent_revoke_subscription,
+            prevent_unlimited_traffic
+         FROM admin_settings
+         WHERE admin_id = ?"
+    );
     $stmtSettings->bind_param("i", $adminId);
     $stmtSettings->execute();
     $settingsResult = $stmtSettings->get_result();
@@ -470,10 +508,9 @@ function getAdminInfo($adminId) {
                 )
                 +
                 (
-                    SELECT IFNULL(SUM(user_deletions.used_traffic), 0) 
-                    + IFNULL(SUM(user_deletions.reseted_usage), 0)
-                    FROM user_deletions
-                    WHERE user_deletions.admin_id = admins.id
+                    SELECT IFNULL(SUM(marzhelp_deleted_users.used_traffic_total), 0)
+                    FROM marzhelp_deleted_users
+                    WHERE marzhelp_deleted_users.admin_id = admins.id
                 )
             ) / 1073741824 AS used_traffic_gb
             FROM admins
@@ -486,9 +523,9 @@ function getAdminInfo($adminId) {
             (
                 (
                     SELECT IFNULL(SUM(
-                        CASE 
-                            WHEN users.data_limit IS NOT NULL THEN users.data_limit 
-                            ELSE users.used_traffic 
+                        CASE
+                            WHEN users.data_limit IS NOT NULL THEN users.data_limit
+                            ELSE users.used_traffic
                         END
                     ), 0)
                     FROM users
@@ -498,15 +535,20 @@ function getAdminInfo($adminId) {
                 (
                     SELECT IFNULL(SUM(user_usage_logs.used_traffic_at_reset), 0)
                     FROM user_usage_logs
-                    WHERE user_usage_logs.user_id IN (
-                        SELECT id FROM users WHERE users.admin_id = admins.id
-                    )
+                    INNER JOIN users ON users.id = user_usage_logs.user_id
+                    WHERE users.admin_id = admins.id
+                      AND users.data_limit IS NULL
                 )
                 +
                 (
-                    SELECT IFNULL(SUM(user_deletions.reseted_usage), 0)
-                    FROM user_deletions
-                    WHERE user_deletions.admin_id = admins.id
+                    SELECT IFNULL(SUM(
+                        COALESCE(
+                            marzhelp_deleted_users.allocated_traffic,
+                            marzhelp_deleted_users.used_traffic_total
+                        )
+                    ), 0)
+                    FROM marzhelp_deleted_users
+                    WHERE marzhelp_deleted_users.admin_id = admins.id
                 )
             ) / 1073741824 AS created_traffic_gb
             FROM admins
@@ -537,7 +579,14 @@ function getAdminInfo($adminId) {
             COUNT(*) AS total_users,
             SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
             SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS expired_users,
-            SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, now(), online_at) = 0 THEN 1 ELSE 0 END) AS online_users
+            SUM(
+                CASE
+                    WHEN online_at IS NOT NULL
+                     AND online_at >= NOW() - INTERVAL 5 MINUTE
+                     AND online_at <= NOW() + INTERVAL 1 MINUTE
+                    THEN 1 ELSE 0
+                END
+            ) AS online_users
         FROM users
         WHERE admin_id = ?
     ");
@@ -548,13 +597,13 @@ function getAdminInfo($adminId) {
     $stmtUserStats->close();
 
     $userLimit = isset($settings['user_limit']) ? $settings['user_limit'] : '♾️';
-    $remainingUserLimit = ($userLimit !== '♾️') ? $userLimit - $userStats['active_users'] : '♾️';
+    $remainingUserLimit = ($userLimit !== '♾️') ? $userLimit - $userStats['total_users'] : '♾️';
 
-    $preventUserCreation = triggerCheck($marzbanConn, 'prevent_user_creation', $adminId);
-    $preventUserReset = triggerCheck($marzbanConn, 'prevent_User_Reset_Usage', $adminId);
-    $preventRevokeSubscription = triggerCheck($marzbanConn, 'prevent_revoke_subscription', $adminId);
-    $preventUnlimitedTraffic = triggerCheck($marzbanConn, 'prevent_unlimited_traffic', $adminId);
-    $preventUserDelete = triggerCheck($marzbanConn, 'admin_delete', $adminId);
+    $preventUserCreation = !empty($settings['prevent_user_creation']);
+    $preventUserReset = !empty($settings['prevent_user_reset']);
+    $preventRevokeSubscription = !empty($settings['prevent_revoke_subscription']);
+    $preventUnlimitedTraffic = !empty($settings['prevent_unlimited_traffic']);
+    $preventUserDelete = !empty($settings['prevent_user_deletion']);
 
     return [
         'username' => $adminUsername,
@@ -774,7 +823,7 @@ function generateStatusMessage($marzbanapi, $chatId, $lang, $sendMessage = true,
 }
 
 function handleCallbackQuery($callback_query) {
-    global $botConn, $marzbanConn, $allowedUsers, $botDbPass, $vpnDbPass, $apiURL, $latestVersion, $marzbanapi;
+    global $botConn, $marzbanConn, $allowedUsers, $botDbPass, $vpnDbPass, $apiURL, $latestVersion, $marzbanapi, $allowSystemCommands;
 
     $callbackId = $callback_query['id'];
     $userId = $callback_query['from']['id'];
@@ -793,6 +842,127 @@ function handleCallbackQuery($callback_query) {
             'callback_query_id' => $callbackId,
             'text' => $lang['error_unauthorized'],
             'show_alert' => false
+        ]);
+        return;
+    }
+
+    if ($data === 'toggle_traffic_triggers' || $data === 'save_admin_traffic') {
+        sendRequest('answerCallbackQuery', [
+            'callback_query_id' => $callbackId,
+            'text' => 'ثبت ترافیک حذف‌شده اکنون به‌صورت خودکار فعال است.',
+            'show_alert' => true
+        ]);
+        return;
+    }
+
+    $systemCallbacks = [
+        'update_bot',
+        'update_marzban',
+        'restart_marzban',
+        'marzban_restart',
+        'marzban_update',
+        'apply_template'
+    ];
+    if (in_array($data, $systemCallbacks, true)) {
+        if ($userRole !== 'main_admin' || empty($allowSystemCommands)) {
+            sendRequest('answerCallbackQuery', [
+                'callback_query_id' => $callbackId,
+                'text' => 'اجرای فرمان‌های سیستم از داخل ربات غیرفعال است.',
+                'show_alert' => true
+            ]);
+            return;
+        }
+    }
+
+    $targetAdminId = marzhelpCallbackAdminId($data);
+    if (
+        $targetAdminId !== null
+        && !marzhelpCanManageAdmin($marzbanConn, (int)$userId, $userRole, $targetAdminId)
+    ) {
+        sendRequest('answerCallbackQuery', [
+            'callback_query_id' => $callbackId,
+            'text' => $lang['error_unauthorized'],
+            'show_alert' => true
+        ]);
+        return;
+    }
+
+    $mainAdminOnlyPrefixes = [
+        'add_admin',
+        'delete_admin',
+        'confirm_delete_admin:',
+        'delete_admin_confirmed:',
+        'change_sudo:',
+        'set_sudo_yes:',
+        'set_sudo_no:',
+        'confirm_sudo_yes:',
+        'confirm_sudo_no:'
+    ];
+    foreach ($mainAdminOnlyPrefixes as $mainAdminOnlyPrefix) {
+        if (strpos($data, $mainAdminOnlyPrefix) === 0 && $userRole !== 'main_admin') {
+            sendRequest('answerCallbackQuery', [
+                'callback_query_id' => $callbackId,
+                'text' => $lang['error_unauthorized'],
+                'show_alert' => true
+            ]);
+            return;
+        }
+    }
+
+    $restrictionCallbacks = [
+        'toggle_prevent_user_creation:' => 'prevent_user_creation',
+        'toggle_prevent_user_deletion:' => 'prevent_user_deletion',
+        'toggle_prevent_user_reset:' => 'prevent_user_reset',
+        'toggle_prevent_revoke_subscription:' => 'prevent_revoke_subscription',
+        'toggle_prevent_unlimited_traffic:' => 'prevent_unlimited_traffic'
+    ];
+    foreach ($restrictionCallbacks as $callbackPrefix => $columnName) {
+        if (strpos($data, $callbackPrefix) !== 0) {
+            continue;
+        }
+
+        $adminId = (int)substr($data, strlen($callbackPrefix));
+        $toggle = $botConn->prepare(
+            "INSERT INTO admin_settings (admin_id, `$columnName`)
+             VALUES (?, 1)
+             ON DUPLICATE KEY UPDATE `$columnName` = 1 - `$columnName`"
+        );
+        $toggle->bind_param('i', $adminId);
+        $toggle->execute();
+        $toggle->close();
+
+        $readValue = $botConn->prepare(
+            "SELECT `$columnName` FROM admin_settings WHERE admin_id = ?"
+        );
+        $readValue->bind_param('i', $adminId);
+        $readValue->execute();
+        $restrictionRow = $readValue->get_result()->fetch_assoc();
+        $restrictionValue = (int)$restrictionRow[$columnName];
+        $readValue->close();
+
+        $syncValue = $marzbanConn->prepare(
+            "INSERT INTO marzhelp_admin_enforcement (admin_id, `$columnName`)
+             VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE `$columnName` = VALUES(`$columnName`)"
+        );
+        $syncValue->bind_param('ii', $adminId, $restrictionValue);
+        $syncValue->execute();
+        $syncValue->close();
+
+        $adminInfo = getAdminInfo($adminId);
+        sendRequest('editMessageText', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $lang['callbackResponse_showRestrictions'],
+            'reply_markup' => getRestrictionsKeyboard(
+                $adminId,
+                $adminInfo['preventUserDeletion'],
+                $adminInfo['preventUserCreation'],
+                $adminInfo['preventUserReset'],
+                $adminInfo['preventRevokeSubscription'],
+                $adminInfo['preventUnlimitedTraffic'],
+                $userId
+            )
         ]);
         return;
     }
@@ -1673,7 +1843,26 @@ function handleCallbackQuery($callback_query) {
         $inboundTag = substr($data, strlen('toggle_disable_inbound:'));
     
         $userState = handleUserState('get', $userId);
-    
+
+        if (
+            $userRole === 'limited_admin'
+            && $userState
+            && !empty($userState['admin_id'])
+            && !marzhelpCanManageAdmin(
+                $marzbanConn,
+                (int)$userId,
+                $userRole,
+                (int)$userState['admin_id']
+            )
+        ) {
+            handleUserState('clear', $userId);
+            sendRequest('sendMessage', [
+                'chat_id' => $chatId,
+                'text' => $lang['error_unauthorized']
+            ]);
+            return;
+        }
+
         if ($userState && $userState['state'] === 'disable_inbounds') {
             $selectedInbounds = json_decode($userState['data'], true);
             if (!$selectedInbounds) {
@@ -2527,16 +2716,14 @@ function handleCallbackQuery($callback_query) {
         logDebug("Setting event time with data: $data");
         $adminId = intval(substr($data, strlen('set_event_time:')));
 
-        $eventName = 'manage_inbound_limits';
-        $eventResult = $marzbanConn->query("SHOW CREATE EVENT `$eventName`");
-        $currentInterval = 1;
-        if ($eventResult && $eventResult->num_rows > 0) {
-            $eventRow = $eventResult->fetch_assoc();
-            $eventBody = $eventRow['Create Event'];
-            preg_match("/EVERY (\d+) SECOND/", $eventBody, $matches);
-            if (isset($matches[1])) {
-                $currentInterval = intval($matches[1]);
-            }
+        $currentInterval = 10;
+        $intervalResult = $marzbanConn->query(
+            "SELECT setting_value
+             FROM marzhelp_runtime_settings
+             WHERE setting_name = 'inbound_sync_interval'"
+        );
+        if ($intervalResult && ($intervalRow = $intervalResult->fetch_assoc())) {
+            $currentInterval = (int)$intervalRow['setting_value'];
         }
 
         $intervals = [1, 3, 5, 10, 30, 60];
@@ -3448,7 +3635,7 @@ function handleCallbackQuery($callback_query) {
             $command = 'sudo /usr/local/bin/marzban update 2>&1';
             $output = shell_exec($command);
             
-              $outputText = implode("\n", $output);
+              $outputText = $output ?? '';
             
               file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - Marzban update output:\n" . $outputText . "\n", FILE_APPEND);
             
@@ -3960,6 +4147,44 @@ if ($data === 'marzban_update') {
         }
     
         $userState = handleUserState('get', $userId);
+
+        if (
+            $userRole === 'limited_admin'
+            && $userState
+            && !empty($userState['admin_id'])
+            && !marzhelpCanManageAdmin(
+                $marzbanConn,
+                (int)$userId,
+                $userRole,
+                (int)$userState['admin_id']
+            )
+        ) {
+            handleUserState('clear', $userId);
+            sendRequest('sendMessage', [
+                'chat_id' => $chatId,
+                'text' => $lang['error_unauthorized']
+            ]);
+            return;
+        }
+
+        $mainAdminOnlyStates = [
+            'waiting_for_username',
+            'waiting_for_password',
+            'waiting_for_sudo',
+            'waiting_for_telegram_id'
+        ];
+        if (
+            $userRole !== 'main_admin'
+            && $userState
+            && in_array($userState['state'], $mainAdminOnlyStates, true)
+        ) {
+            handleUserState('clear', $userId);
+            sendRequest('sendMessage', [
+                'chat_id' => $chatId,
+                'text' => $lang['error_unauthorized']
+            ]);
+            return;
+        }
 
         if ($userState) {
 

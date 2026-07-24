@@ -1,19 +1,29 @@
 <?php
 
-require_once 'bot.php';
+require __DIR__ . '/app/bootstrap.php';
+require_once __DIR__ . '/app/security.php';
 
-$update = json_decode(file_get_contents('php://input'), true);
+if (!marzhelpValidateWebhookSecret($webhookSecret ?? null)) {
+    http_response_code(403);
+    exit;
+}
+
+$rawUpdate = file_get_contents('php://input');
+$update = json_decode($rawUpdate, true);
+if (!is_array($update)) {
+    http_response_code(400);
+    exit;
+}
+
+require_once __DIR__ . '/bot.php';
 
 try {
-    if (isset($update['message'])) {
-        $message = $update['message'];
-        handleMessage($message);
-
-    } elseif (isset($update['callback_query'])) {
+    if (isset($update['message']) && is_array($update['message'])) {
+        handleMessage($update['message']);
+    } elseif (isset($update['callback_query']) && is_array($update['callback_query'])) {
         handleCallbackQuery($update['callback_query']);
-
     }
-
-} catch (Exception $e) {
-    file_put_contents('bot_log.txt', date('Y-m-d H:i:s') . " - Error: " . $e->getMessage() . "\n", FILE_APPEND);
+} catch (Throwable $e) {
+    error_log('MarzHelp webhook error: ' . $e->getMessage());
+    http_response_code(500);
 }
