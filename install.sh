@@ -2,6 +2,11 @@
 
 set -e
 
+readonly MARZHELP_REPOSITORY="https://github.com/smorad3363/marzhelp.git"
+readonly MARZHELP_BRANCH="production"
+readonly MARZHELP_RAW_BASE="https://raw.githubusercontent.com/smorad3363/marzhelp/production"
+readonly MARZHELP_DIRECTORY="/var/www/html/marzhelp"
+
 # Function to read environment variables
 read_env_variable() {
     local var_name="$1"
@@ -50,7 +55,7 @@ get_mysql_root_password() {
         fi
     done
 
-    echo -e "\033[1;32mSuccess:\033[0m MySQL root password: \033[1;34m$password\033[0m"
+    echo -e "\033[1;32mSuccess:\033[0m MySQL root password was loaded."
     # Save the password to /root/marzhelp.txt
     echo -e "\033[1;32mSuccess:\033[0m MySQL root password set and saved to \033[1;34m$config_file\033[0m"
     
@@ -561,6 +566,17 @@ fi
 }
 install_marzhelp() {
 
+    if [ -f "$MARZHELP_DIRECTORY/config.php" ]; then
+        echo "Existing MarzHelp installation detected. Starting safe update..."
+        local updater
+        updater=$(mktemp)
+        curl -fsSL "$MARZHELP_RAW_BASE/update.sh" -o "$updater"
+        chmod 700 "$updater"
+        bash "$updater"
+        rm -f "$updater"
+        return
+    fi
+
     # Check if mysql-client is installed
     if ! command -v mysql &> /dev/null; then
         echo "MySQL client not found. Installing mysql-client..."
@@ -605,12 +621,13 @@ EOF
     fi
 
     echo "Cloning Marzhelp repository from GitHub..."
-    git clone https://github.com/hadimousavi79/marzhelp.git /var/www/html/marzhelp
+    git clone --branch "$MARZHELP_BRANCH" --single-branch "$MARZHELP_REPOSITORY" /var/www/html/marzhelp
 
     # Define commands and permissions to apply
     commands=(
         "sudo chown -R www-data:www-data /var/www/html/marzhelp/"
         "sudo chmod -R 755 /var/www/html/marzhelp/"
+        "sudo install -d -o www-data -g www-data -m 700 /var/backups/marzhelp"
         "sudo chown www-data:www-data /usr/local/bin/marzban"
         "sudo chmod +x /usr/local/bin/marzban"
         "sudo chmod +x /usr/bin/crontab"
@@ -724,7 +741,7 @@ display_menu() {
     clear
     server_ip=$(curl -s http://checkip.amazonaws.com)  
     uptime_info=$(uptime -p)  
-    github_link="https://github.com/ppouria/marzhelp"  
+    github_link="https://github.com/smorad3363/marzhelp"
 
     echo -e "\033[1;36m=======MarzHelp=======\033[0m"
     echo -e "\033[1;32mServer IP: \033[1;37m$server_ip\033[0m"  
@@ -770,8 +787,21 @@ main() {
 }
 
 ensure_root
-read_env_variable
 check_marzhelp_config
 cat_config_with_color
 get_mysql_root_password
-main
+
+case "${1:-}" in
+    --full)
+        install_nginx
+        install_php_packages
+        configure_nginx_ssl
+        install_marzhelp
+        ;;
+    --install-only)
+        install_marzhelp
+        ;;
+    *)
+        main
+        ;;
+esac

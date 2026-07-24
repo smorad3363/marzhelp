@@ -2431,7 +2431,7 @@ function handleCallbackQuery($callback_query) {
         }
 
         if ($adText === null) {
-            $rawUrl = "https://raw.githubusercontent.com/ppouria/marzhelp/dev/ad_text.txt";
+            $rawUrl = "https://raw.githubusercontent.com/smorad3363/marzhelp/dev/ad_text.txt";
             $response = @file_get_contents($rawUrl);
             if ($response !== false) {
                 $adText = $response;
@@ -3299,38 +3299,23 @@ function handleCallbackQuery($callback_query) {
                 'text' => $lang['update_in_progress']
             ]);
         
-            $command = "cd /var/www/html/marzhelp && git reset --hard origin/main && git pull";
+            $command = "bash /var/www/html/marzhelp/update.sh 2>&1";
             exec($command, $output, $return_var);
         
             if ($return_var === 0) {
-                $dbUpdateCommand = "php /var/www/html/marzhelp/table.php";
-                exec($dbUpdateCommand, $db_output, $db_return_var);
-        
-                            sendRequest('deleteMessage', ['chat_id' => $chatId, 'message_id' => $userState['message_id']]);
-        
-                if ($db_return_var === 0 && empty($db_output)) {
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['update_success'] . " $latestVersion"
-                    ]);
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['settings_menu'] . "\n🟢 Bot version: " . $latestVersion,
-                        'reply_markup' => json_encode(getSettingsMenuKeyboard($userId))
-                    ]);
-                } else {
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['db_update_failed']
-                    ]);
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['settings_menu'] . "\n🟢 Bot version: " . $latestVersion,
-                        'reply_markup' => json_encode(getSettingsMenuKeyboard($userId))
-                    ]);
-                }
+                sendRequest('deleteMessage', ['chat_id' => $chatId, 'message_id' => $userState['message_id']]);
+                sendRequest('sendMessage', [
+                    'chat_id' => $chatId,
+                    'text' => $lang['update_success'] . " $latestVersion"
+                ]);
+                sendRequest('sendMessage', [
+                    'chat_id' => $chatId,
+                    'text' => $lang['settings_menu'] . "\n🟢 Bot version: " . $latestVersion,
+                    'reply_markup' => json_encode(getSettingsMenuKeyboard($userId))
+                ]);
             } else {
-                            sendRequest('deleteMessage', ['chat_id' => $chatId, 'message_id' => $userState['message_id']]);
+                error_log("MarzHelp update failed: " . implode("\n", $output));
+                sendRequest('deleteMessage', ['chat_id' => $chatId, 'message_id' => $userState['message_id']]);
                 sendRequest('sendMessage', [
                     'chat_id' => $chatId,
                     'text' => $lang['update_failed']
