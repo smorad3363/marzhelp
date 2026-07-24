@@ -25,7 +25,9 @@ git -C "$target_seed" config user.name "MarzHelp Test"
 git -C "$target_seed" config user.email "test@example.invalid"
 printf 'new release\n' > "${target_seed}/release.txt"
 printf '<?php exit(0);\n' > "${target_seed}/table.php"
-git -C "$target_seed" add release.txt table.php
+cp "${PROJECT_ROOT}/update.sh" "${target_seed}/update.sh"
+chmod +x "${target_seed}/update.sh"
+git -C "$target_seed" add release.txt table.php update.sh
 git -C "$target_seed" commit --quiet -m "target release"
 git -C "$target_seed" branch -M production
 git -C "$target_seed" remote add origin "$target_remote"
@@ -92,6 +94,7 @@ bash "${PROJECT_ROOT}/update.sh"
 [[ -f "$table_marker" ]]
 [[ "$(git hash-object "${installed_directory}/config.php")" == "$config_hash_before" ]]
 [[ "$(git -C "$installed_directory" remote get-url origin)" == *"/target.git" ]]
+[[ -x "${installed_directory}/update.sh" ]]
 find "$backup_directory" -name marzhelp.sql -type f -size +0c | grep -q .
 find "$backup_directory" -name marzban.sql -type f -size +0c | grep -q .
 

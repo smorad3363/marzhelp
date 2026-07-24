@@ -57,10 +57,11 @@ done
 [[ -f "$CONFIG_FILE" ]] || fail "Existing configuration was not found at ${CONFIG_FILE}"
 
 application_owner_id="$(stat -c '%u' "$MARZHELP_DIRECTORY")"
+application_group_id="$(stat -c '%g' "$MARZHELP_DIRECTORY")"
 mkdir -p "$BACKUP_ROOT"
 chmod 700 "$BACKUP_ROOT"
 if [[ "$(id -u)" -eq 0 ]]; then
-    chown "$application_owner_id" "$BACKUP_ROOT"
+    chown "${application_owner_id}:${application_group_id}" "$BACKUP_ROOT"
 fi
 release_id="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_directory="${BACKUP_ROOT}/${release_id}"
@@ -127,6 +128,12 @@ if git "${git_config[@]}" ls-tree -r --name-only "origin/${MARZHELP_BRANCH}" | g
 fi
 
 code_changed=0
+restore_ownership() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown -R "${application_owner_id}:${application_group_id}" "$MARZHELP_DIRECTORY" "$BACKUP_ROOT"
+    fi
+}
+
 rollback_code() {
     local exit_code=$?
     cleanup_sensitive_files
@@ -135,6 +142,7 @@ rollback_code() {
         git "${git_config[@]}" reset --hard "$old_commit" >/dev/null 2>&1 || true
         cp "${backup_directory}/config.php" "$CONFIG_FILE" || true
     fi
+    restore_ownership
     exit "$exit_code"
 }
 trap rollback_code EXIT
@@ -150,9 +158,7 @@ done < <(find "$MARZHELP_DIRECTORY" -name '*.php' -type f -print0)
 log "Applying database migrations and cron configuration."
 php "${MARZHELP_DIRECTORY}/table.php"
 
-if [[ "$(id -u)" -eq 0 ]]; then
-    chown -R "$application_owner_id" "$BACKUP_ROOT"
-fi
+restore_ownership
 
 trap - EXIT
 log "Update completed successfully. Backup: ${backup_directory}"
