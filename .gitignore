@@ -1,1 +1,7 @@
 web
+config.php
+config.local.php
+.update-backups/
+*.log
+logs.txt
+bot_log.txt

@@ -2,20 +2,26 @@
 $botToken = '';
 $apiURL = "https://api.telegram.org/bot$botToken/";
 $botdomain = '';
+$webhookSecret = ''; // Generate at least 32 random characters. Never commit the real value.
+$allowSystemCommands = false;
+$storagePath = '/var/lib/marzhelp';
 
 $allowedUsers = [1088532278, 987654321];
 
 $botDbHost = 'localhost';
-$botDbUser = 'root';
+$botDbUser = 'marzhelp';
 $botDbPass = '';
 $botDbName = 'marzhelp';
 
 $vpnDbHost = ''; 
 // If you install the robot on an external host or server
 # $vpnDbPort = 3306; 
-$vpnDbUser = 'root';
+$vpnDbUser = 'marzhelp';
 $vpnDbPass = '';
 $vpnDbName = 'marzban';
+
+$migrationDbUser = 'marzhelp_migrate';
+$migrationDbPass = '';
 
 // Marzban Panel Configuration
 $marzbanUrl = 'https://your-marzban-server.com'; 
