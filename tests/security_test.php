@@ -27,6 +27,7 @@ assertSameValue(42, marzhelpCallbackAdminId('show_restrictions:42'), 'restrictio
 assertSameValue(42, marzhelpCallbackAdminId('confirm_delete_admin:42'), 'delete callback');
 assertSameValue(42, marzhelpCallbackAdminId('select_add_protocol:vless:42'), 'protocol callback');
 assertSameValue(42, marzhelpCallbackAdminId('set_calculate_volume:used_traffic:42'), 'volume callback');
+assertSameValue(42, marzhelpCallbackAdminId('set_max_duration:42'), 'duration callback');
 assertSameValue(null, marzhelpCallbackAdminId('set_lang_fa'), 'non-admin callback');
 assertSameValue(null, marzhelpCallbackAdminId('unknown:42'), 'unknown callback');
 

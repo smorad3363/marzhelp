@@ -132,7 +132,7 @@ class Notification {
             $messageId = $result['result']['message_id'];
             $userId = $parameters['chat_id'];
             
-            $stmt = $this->dbBot->prepare("UPDATE user_states SET message_id = ? WHERE user_id = ?");
+            $stmt = $this->dbBot->prepare("UPDATE marzhelp_user_states SET message_id = ? WHERE user_id = ?");
             if ($stmt) {
                 $stmt->bind_param("ii", $messageId, $userId);
                 $stmt->execute();
@@ -163,7 +163,7 @@ class PanelManager {
     private function getLang($userId) {
         $langCode = 'en';
     
-        $stmt = $this->dbBot->getConnection()->prepare("SELECT lang FROM user_states WHERE user_id = ?");
+        $stmt = $this->dbBot->getConnection()->prepare("SELECT lang FROM marzhelp_user_states WHERE user_id = ?");
         if ($stmt) {
             $stmt->bind_param("i", $userId);
             if ($stmt->execute()) {
@@ -228,7 +228,7 @@ class PanelManager {
     }
 
     private function calculateTraffic($adminId) {
-        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT calculate_volume FROM admin_settings WHERE admin_id = ?");
+        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT calculate_volume FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmtSettings->bind_param("i", $adminId);
         $stmtSettings->execute();
         $settingsResult = $stmtSettings->get_result();
@@ -265,10 +265,7 @@ class PanelManager {
                           AND users.data_limit IS NULL
                     ), 0) +
                     IFNULL((
-                        SELECT SUM(COALESCE(
-                            marzhelp_deleted_users.allocated_traffic,
-                            marzhelp_deleted_users.used_traffic_total
-                        ))
+                        SELECT SUM(marzhelp_deleted_users.used_traffic_total)
                         FROM marzhelp_deleted_users
                         WHERE marzhelp_deleted_users.admin_id = admins.id
                     ), 0)
@@ -287,7 +284,7 @@ class PanelManager {
     private function fetchSettings($adminId) {
         $stmt = $this->dbBot->getConnection()->prepare("SELECT total_traffic, expiry_date, status, user_limit, calculate_volume, hashed_password_before, 
                                       last_traffic_notification, last_expiry_notification 
-                                      FROM admin_settings WHERE admin_id = ?");
+                                      FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -379,7 +376,7 @@ class PanelManager {
         $adminUsername = $admin['username'];
         $stmtAdmin->close();
     
-        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT total_traffic, expiry_date, status, user_limit, calculate_volume FROM admin_settings WHERE admin_id = ?");
+        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT total_traffic, expiry_date, status, user_limit, calculate_volume FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmtSettings->bind_param("i", $adminId);
         $stmtSettings->execute();
         $settingsResult = $stmtSettings->get_result();
@@ -427,10 +424,7 @@ class PanelManager {
                 +
                 (
                     SELECT IFNULL(SUM(
-                        COALESCE(
-                            marzhelp_deleted_users.allocated_traffic,
-                            marzhelp_deleted_users.used_traffic_total
-                        )
+                        marzhelp_deleted_users.used_traffic_total
                     ), 0)
                     FROM marzhelp_deleted_users
                     WHERE marzhelp_deleted_users.admin_id = admins.id
@@ -480,7 +474,7 @@ class PanelManager {
         $stmtUserStats->close();
     
         $userLimit = $settings['user_limit'] ?? self::INFINITY;
-        $remainingUserLimit = $userLimit !== self::INFINITY ? $userLimit - $userStats['total_users'] : self::INFINITY;
+        $remainingUserLimit = $userLimit;
     
         $preventUserCreation = $this->triggerCheck('prevent_user_creation', $adminId);
         $preventUserReset = $this->triggerCheck('prevent_User_Reset_Usage', $adminId);
@@ -509,23 +503,24 @@ class PanelManager {
     }
 
     private function triggerCheck($triggerName, $adminId) {
-        $existingTriggerQuery = $this->dbMarzban->getConnection()->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        if ($existingTriggerQuery && $existingTriggerQuery->num_rows > 0) {
-            $triggerResult = $this->dbMarzban->getConnection()->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                    return in_array((string)$adminId, $adminIds);
-                }
-            }
-        }
-        return false;
+        $columns = [
+            'prevent_user_creation' => 'prevent_user_creation',
+            'admin_delete' => 'prevent_user_deletion',
+            'prevent_User_Reset_Usage' => 'prevent_user_reset',
+            'prevent_revoke_subscription' => 'prevent_revoke_subscription',
+            'prevent_unlimited_traffic' => 'prevent_unlimited_traffic',
+        ];
+        if (!isset($columns[$triggerName])) return false;
+        $column = $columns[$triggerName];
+        $statement = $this->dbBot->getConnection()->prepare(
+            "SELECT `$column` FROM marzhelp_admin_settings WHERE admin_id = ?"
+        );
+        $statement->bind_param("i", $adminId);
+        $statement->execute();
+        $row = $statement->get_result()->fetch_assoc();
+        $statement->close();
+        return !empty($row[$column]);
     }
-
     private function getAdminKeyboard($adminId, $status) {
         $telegramId = $this->fetchTelegramId($adminId);
         if ($telegramId) {
@@ -535,7 +530,7 @@ class PanelManager {
             $lang = $this->getLang($firstOwnerId);
         }
     
-        $stmt = $this->dbBot->getConnection()->prepare("SELECT status, hashed_password_before FROM admin_settings WHERE admin_id = ?");
+        $stmt = $this->dbBot->getConnection()->prepare("SELECT status, hashed_password_before FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -588,7 +583,7 @@ class PanelManager {
             $currentStatus['time'] = 'expired';
             $newStatus = json_encode($currentStatus);
 
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             if ($stmt) {
                 $stmt->bind_param("si", $newStatus, $adminId);
                 $stmt->execute();
@@ -598,7 +593,7 @@ class PanelManager {
             $currentStatus['time'] = 'active';
             $newStatus = json_encode($currentStatus);
 
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             if ($stmt) {
                 $stmt->bind_param("si", $newStatus, $adminId);
                 $stmt->execute();
@@ -619,219 +614,8 @@ class PanelManager {
         }
     }
 
-    private function dropTriggerIfExists($triggerName) {
-        $this->dbMarzban->getConnection()->query("DROP TRIGGER IF EXISTS `$triggerName`");
-    }
-
-    private function manageTrigger($adminId) {
-        $triggerNames = [
-            'user_creation_traffic',
-            'user_update_traffic'  
-        ];
-    
-        foreach ($triggerNames as $triggerName) {
-            $existingTriggerQuery = $this->dbMarzban->getConnection()->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-            $existingAdminIds = [];
-    
-            if ($existingTriggerQuery && $existingTriggerQuery->num_rows > 0) {
-                $triggerResult = $this->dbMarzban->getConnection()->query("SHOW CREATE TRIGGER `$triggerName`");
-                if ($triggerResult && $triggerResult->num_rows > 0) {
-                    $triggerRow = $triggerResult->fetch_assoc();
-                    $triggerBody = $triggerRow['SQL Original Statement'];
-                    if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                        $existingAdminIdsStr = $matches[1];
-                        $existingAdminIdsStr = str_replace(' ', '', $existingAdminIdsStr);
-                        $existingAdminIds = explode(',', $existingAdminIdsStr);
-                    }
-                }
-            }
-    
-            if (!in_array($adminId, $existingAdminIds)) {
-                $existingAdminIds[] = $adminId;
-            }
-    
-            if (!empty($existingAdminIds)) {
-                $adminIdsStr = implode(', ', $existingAdminIds);
-                $actionType = ($triggerName === 'user_creation_traffic') ? 'INSERT' : 'UPDATE';
-    
-                $triggerBody = "
-                CREATE TRIGGER `$triggerName` BEFORE $actionType ON `users`
-                FOR EACH ROW
-                BEGIN
-                    IF NEW.admin_id IN ($adminIdsStr) THEN
-                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Operation not allowed for this admin ID.';
-                    END IF;
-                END;
-                ";
-    
-                if (!$existingTriggerQuery || $existingTriggerQuery->num_rows == 0) {
-                    $this->dbMarzban->getConnection()->query($triggerBody);
-                    if ($this->dbMarzban->getConnection()->error) {
-                        file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - SQL Error: " . $this->dbMarzban->getConnection()->error . " - Query: $triggerBody\n", FILE_APPEND);
-                    }
-                }
-            }
-        }
-    }
-
-    private function createTrafficTriggers() {
-        $stmt = $this->dbBot->getConnection()->prepare("SELECT admin_id, calculate_volume, total_traffic FROM admin_settings WHERE total_traffic IS NOT NULL AND total_traffic > 0");
-        $stmt->execute();
-        $result = $stmt->get_result();
-        $admins = [];
-        while ($row = $result->fetch_assoc()) {
-            $admins[$row['admin_id']] = [
-                'calculate_volume' => $row['calculate_volume'],
-                'total_traffic' => $row['total_traffic']
-            ];
-        }
-        $stmt->close();
-
-        $triggerNames = [
-            'prevent_insert_traffic' => 'INSERT',
-            'prevent_update_traffic' => 'UPDATE'
-        ];
-
-        foreach ($triggerNames as $triggerName => $actionType) {
-            $existingAdminIds = [];
-            $triggerCheck = $this->dbMarzban->getConnection()->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-            if ($triggerCheck && $triggerCheck->num_rows > 0) {
-                $triggerResult = $this->dbMarzban->getConnection()->query("SHOW CREATE TRIGGER `$triggerName`");
-                if ($triggerResult && $triggerResult->num_rows > 0) {
-                    $triggerRow = $triggerResult->fetch_assoc();
-                    $triggerBody = $triggerRow['SQL Original Statement'];
-                    if (preg_match("/CASE NEW.admin_id\s*(.*?)\s*ELSE SET max_limit = 0;\s*END CASE;/s", $triggerBody, $matches)) {
-                        $caseBlock = $matches[1];
-                        preg_match_all("/WHEN (\d+) THEN SET max_limit = (\d+);/", $caseBlock, $adminMatches, PREG_SET_ORDER);
-                        foreach ($adminMatches as $match) {
-                            $existingAdminIds[$match[1]] = $match[2];
-                        }
-                    }
-                }
-            }
-
-            $requiredAdminIds = array_filter($admins, function($admin) {
-                return $admin['calculate_volume'] === 'created_traffic';
-            });
-
-            $updatedAdminIds = [];
-            foreach ($requiredAdminIds as $adminId => $admin) {
-                if (isset($admin['total_traffic']) && is_numeric($admin['total_traffic']) && $admin['total_traffic'] > 0) {
-                $updatedAdminIds[$adminId] = $admin;
-                } else {
-                    file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - Invalid total_traffic for admin_id $adminId: " . var_export($admin['total_traffic'], true) . "\n", FILE_APPEND);
-                }
-            }
-
-            if (empty($updatedAdminIds)) {
-                $this->dbMarzban->getConnection()->query("DROP TRIGGER IF EXISTS `$triggerName`");
-                file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - No valid admins for trigger $triggerName, dropping trigger.\n", FILE_APPEND);
-            } else {
-                $caseStatements = '';
-                foreach ($updatedAdminIds as $adminId => $admin) {
-                    $maxLimit = (int)$admin['total_traffic'];
-                    $caseStatements .= "WHEN $adminId THEN SET max_limit = $maxLimit;\n";
-                }
-
-            if ($actionType === 'INSERT') {
-                $triggerBody = "
-                CREATE TRIGGER `$triggerName` BEFORE $actionType ON `users`
-                FOR EACH ROW
-                BEGIN
-                    DECLARE total_data_limit BIGINT DEFAULT 0;
-                    DECLARE max_limit BIGINT DEFAULT 0;
-
-                    CASE NEW.admin_id
-                        $caseStatements
-                        ELSE SET max_limit = 0;
-                    END CASE;
-
-                    IF max_limit > 0 THEN
-                        SELECT COALESCE(SUM(data_limit), 0) INTO total_data_limit
-                        FROM users
-                        WHERE admin_id = NEW.admin_id;
-
-                        IF (total_data_limit + NEW.data_limit) > max_limit THEN
-                            SIGNAL SQLSTATE '45000'
-                            SET MESSAGE_TEXT = 'Admin has exceeded the total data limit.';
-                        END IF;
-                    END IF;
-                END;
-                ";
-                } else { 
-                    $triggerBody = "
-                    CREATE TRIGGER `$triggerName` BEFORE $actionType ON `users`
-                    FOR EACH ROW
-                    BEGIN
-                        DECLARE total_data_limit BIGINT DEFAULT 0;
-                        DECLARE max_limit BIGINT DEFAULT 0;
-
-                        CASE NEW.admin_id
-                            $caseStatements
-                            ELSE SET max_limit = 0;
-                        END CASE;
-
-                        IF max_limit > 0 THEN
-                            IF (NEW.used_traffic <=> OLD.used_traffic AND 
-                                NEW.sub_updated_at <=> OLD.sub_updated_at AND 
-                                NEW.last_status_change <=> OLD.last_status_change AND 
-                                NEW.sub_last_user_agent <=> OLD.sub_last_user_agent AND 
-                                NEW.online_at <=> OLD.online_at AND 
-                                NEW.edit_at <=> OLD.edit_at AND 
-                                NEW.data_limit = OLD.data_limit AND 
-                                NEW.admin_id = OLD.admin_id) THEN
-                                SET max_limit = 0;
-                            ELSE
-                                SELECT COALESCE(SUM(data_limit), 0) INTO total_data_limit
-                                FROM users
-                                WHERE admin_id = NEW.admin_id;
-
-                                IF (total_data_limit + NEW.data_limit - OLD.data_limit) > max_limit THEN
-                                    SIGNAL SQLSTATE '45000'
-                                    SET MESSAGE_TEXT = 'Admin has exceeded the total data limit.';
-                                END IF;
-                            END IF;
-                        END IF;
-                    END;
-                    ";
-                }
-
-                $this->dbMarzban->getConnection()->query("DROP TRIGGER IF EXISTS `$triggerName`");
-                $this->dbMarzban->getConnection()->query($triggerBody);
-
-                if ($this->dbMarzban->getConnection()->error) {
-                    file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - SQL Error: " . $this->dbMarzban->getConnection()->error . " - Query: $triggerBody\n", FILE_APPEND);
-                }
-            }
-        }
-    }
-
-    private function manageCreatedTrafficTrigger($adminId, $insertTriggerName = 'user_creation_traffic', $updateTriggerName = 'user_update_traffic') {
-        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT calculate_volume, total_traffic FROM admin_settings WHERE admin_id = ?");
-        $stmtSettings->bind_param("i", $adminId);
-        $stmtSettings->execute();
-        $settingsResult = $stmtSettings->get_result();
-        $settings = $settingsResult->fetch_assoc();
-        $stmtSettings->close();
-    
-        if (!$settings || $settings['total_traffic'] === null) return;
-    
-        $adminInfo = $this->gettingadmininfo($adminId);
-        if (!$adminInfo) return;
-        
-        $remainingTraffic = $adminInfo['remainingTraffic'];
-        $isOverLimit = $remainingTraffic !== self::INFINITY && $remainingTraffic <= 0;
-
-        if ($isOverLimit) {
-            $this->manageTrigger($adminId);
-        } else {
-            $this->dropTriggerIfExists($insertTriggerName);
-            $this->dropTriggerIfExists($updateTriggerName);
-        }
-    }
-
     public function manageTrafficUsage($adminId, $adminInfo) {
-        $stmt = $this->dbBot->getConnection()->prepare("SELECT status, total_traffic FROM admin_settings WHERE admin_id = ?");
+        $stmt = $this->dbBot->getConnection()->prepare("SELECT status, total_traffic FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -859,7 +643,7 @@ class PanelManager {
     
             $currentStatus['data'] = 'exhausted';
             $newStatus = json_encode($currentStatus);
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -867,7 +651,7 @@ class PanelManager {
         } elseif ($remainingTraffic > 0 && $currentStatus['data'] === 'exhausted') {
             $currentStatus['data'] = 'active';
             $newStatus = json_encode($currentStatus);
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -875,102 +659,6 @@ class PanelManager {
         }
     
         return $remainingTraffic;
-    }
-
-    private function syncAdminEnforcement($adminId, $adminInfo) {
-        $statement = $this->dbBot->getConnection()->prepare(
-            "SELECT
-                user_limit,
-                total_traffic,
-                calculate_volume,
-                prevent_user_creation,
-                prevent_user_deletion,
-                prevent_user_reset,
-                prevent_revoke_subscription,
-                prevent_unlimited_traffic
-             FROM admin_settings
-             WHERE admin_id = ?"
-        );
-        $statement->bind_param("i", $adminId);
-        $statement->execute();
-        $settings = $statement->get_result()->fetch_assoc();
-        $statement->close();
-
-        if (!$settings) {
-            $delete = $this->dbMarzban->getConnection()->prepare(
-                "DELETE FROM marzhelp_admin_enforcement WHERE admin_id = ?"
-            );
-            $delete->bind_param("i", $adminId);
-            $delete->execute();
-            $delete->close();
-            return;
-        }
-
-        $userLimit = (
-            $settings['user_limit'] !== null
-            && (int)$settings['user_limit'] > 0
-        ) ? (int)$settings['user_limit'] : null;
-        $trafficLimit = (
-            $settings['total_traffic'] !== null
-            && (int)$settings['total_traffic'] > 0
-        ) ? (int)$settings['total_traffic'] : null;
-        $trafficMode = $settings['calculate_volume'] === 'created_traffic'
-            ? 'created_traffic'
-            : 'used_traffic';
-        $trafficExhausted = (
-            $trafficLimit !== null
-            && is_numeric($adminInfo['remainingTraffic'])
-            && (float)$adminInfo['remainingTraffic'] <= 0
-        ) ? 1 : 0;
-        $accountExpired = (
-            $adminInfo['expiryDate'] !== self::INFINITY
-            && strtotime($adminInfo['expiryDate']) < strtotime('tomorrow')
-        ) ? 1 : 0;
-
-        $upsert = $this->dbMarzban->getConnection()->prepare(
-            "INSERT INTO marzhelp_admin_enforcement
-                (
-                    admin_id,
-                    user_limit,
-                    traffic_limit,
-                    traffic_mode,
-                    traffic_exhausted,
-                    account_expired,
-                    prevent_user_creation,
-                    prevent_user_deletion,
-                    prevent_user_reset,
-                    prevent_revoke_subscription,
-                    prevent_unlimited_traffic
-                )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-                user_limit = VALUES(user_limit),
-                traffic_limit = VALUES(traffic_limit),
-                traffic_mode = VALUES(traffic_mode),
-                traffic_exhausted = VALUES(traffic_exhausted),
-                account_expired = VALUES(account_expired),
-                prevent_user_creation = VALUES(prevent_user_creation),
-                prevent_user_deletion = VALUES(prevent_user_deletion),
-                prevent_user_reset = VALUES(prevent_user_reset),
-                prevent_revoke_subscription = VALUES(prevent_revoke_subscription),
-                prevent_unlimited_traffic = VALUES(prevent_unlimited_traffic)"
-        );
-        $upsert->bind_param(
-            "iiisiiiiiii",
-            $adminId,
-            $userLimit,
-            $trafficLimit,
-            $trafficMode,
-            $trafficExhausted,
-            $accountExpired,
-            $settings['prevent_user_creation'],
-            $settings['prevent_user_deletion'],
-            $settings['prevent_user_reset'],
-            $settings['prevent_revoke_subscription'],
-            $settings['prevent_unlimited_traffic']
-        );
-        $upsert->execute();
-        $upsert->close();
     }
 
     private function notifyAdmins() {
@@ -998,7 +686,7 @@ class PanelManager {
         $lastTrafficNotification = $adminInfo['last_traffic_notification'];
 
         if ($remainingTraffic > 300 && $lastTrafficNotification !== null) {
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET last_traffic_notification = NULL WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET last_traffic_notification = NULL WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $stmt->close();
@@ -1019,7 +707,7 @@ class PanelManager {
             $message = sprintf($lang['traffic_warning'], $adminInfo['username'], $threshold);
             $this->notification->sendMessage($telegramId, $message);
 
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET last_traffic_notification = ? WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET last_traffic_notification = ? WHERE admin_id = ?");
             $stmt->bind_param("ii", $threshold, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -1035,7 +723,7 @@ class PanelManager {
         $lastExpiryNotification = $adminInfo['last_expiry_notification'];
 
         if ($daysLeft > 7 && $lastExpiryNotification !== null) {
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET last_expiry_notification = NULL WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET last_expiry_notification = NULL WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $stmt->close();
@@ -1056,96 +744,13 @@ class PanelManager {
             $message = sprintf($lang['panel_expiry_warning'], $adminInfo['username'], $daysThreshold);
             $this->notification->sendMessage($telegramId, $message);
 
-            $stmt = $this->dbBot->getConnection()->prepare("UPDATE admin_settings SET last_expiry_notification = NOW() WHERE admin_id = ?");
+            $stmt = $this->dbBot->getConnection()->prepare("UPDATE marzhelp_admin_settings SET last_expiry_notification = NOW() WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $stmt->close();
         }
     }
 
-    private function manageUserLimitTrigger($adminId, $triggerName = 'cron_prevent_user_creation') {
-        $stmtSettings = $this->dbBot->getConnection()->prepare("SELECT user_limit FROM admin_settings WHERE admin_id = ?");
-        $stmtSettings->bind_param("i", $adminId);
-        $stmtSettings->execute();
-        $settingsResult = $stmtSettings->get_result();
-        $settings = $settingsResult->fetch_assoc();
-        $stmtSettings->close();
-
-        if (!$settings || $settings['user_limit'] === null) return;
-        $userLimit = (int) $settings['user_limit'];
-        if ($userLimit <= 0) return;
-
-        $userStats = $this->fetchUserStats($adminId);
-        $activeUsers = $userStats['active_users'];
-
-        $existingTriggerQuery = $this->dbMarzban->getConnection()->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $existingAdminIds = [];
-
-        if ($existingTriggerQuery && $existingTriggerQuery->num_rows > 0) {
-            $triggerResult = $this->dbMarzban->getConnection()->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $existingAdminIdsStr = $matches[1];
-                    $existingAdminIdsStr = str_replace(' ', '', $existingAdminIdsStr);
-                    $existingAdminIds = explode(',', $existingAdminIdsStr);
-                }
-            }
-        }
-
-        $isOverLimit = ($activeUsers >= $userLimit);
-
-        if ($isOverLimit) {
-            if (!in_array($adminId, $existingAdminIds)) {
-                $existingAdminIds[] = $adminId;
-
-                $stmt = $this->dbMarzban->getConnection()->prepare("SELECT telegram_id, username FROM admins WHERE id = ?");
-                $stmt->bind_param("i", $adminId);
-                $stmt->execute();
-                $result = $stmt->get_result();
-                if ($result->num_rows > 0) {
-                    $admin = $result->fetch_assoc();
-                    $telegramId = $admin['telegram_id'];
-                    $username = $admin['username'];
-
-                    $firstOwnerId = reset($this->allowedUsers);
-                    $lang = !empty($telegramId) ? $this->getLang($telegramId) : $this->getLang($firstOwnerId);
-                    $message = sprintf($lang['user_limit_exceeded'], $username);
-
-                    if (!empty($telegramId)) {
-                        $this->notification->sendMessage($telegramId, $message);
-                    }
-
-                    foreach ($this->allowedUsers as $ownerId) {
-                        $this->notification->sendMessage($ownerId, $message);
-                    }
-                }
-                $stmt->close();
-            }
-        } else {
-            $key = array_search($adminId, $existingAdminIds);
-            if ($key !== false) {
-                unset($existingAdminIds[$key]);
-            }
-        }
-
-        $this->dbMarzban->getConnection()->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        if (!empty($existingAdminIds)) {
-            $adminIdsStr = implode(', ', $existingAdminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE INSERT ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF NEW.admin_id IN ($adminIdsStr) THEN
-                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'User creation not allowed for this admin ID.';
-                END IF;
-            END;
-            ";
-            $this->dbMarzban->getConnection()->query($triggerBody);
-        }
-    }
-    
     private function ensureMarzbanAdminIsSudo($marzbanAdminUsername) {
         $stmt = $this->dbMarzban->getConnection()->prepare("SELECT id, is_sudo FROM admins WHERE username = ?");
         $stmt->bind_param("s", $marzbanAdminUsername);
@@ -1174,9 +779,62 @@ class PanelManager {
             $stmt->close();
         }
     }
+
+    /** Synchronize inbound restrictions with DML only; Marzban owns the schema. */
+    private function syncInboundLimits() {
+        $connection = $this->dbMarzban->getConnection();
+        $queries = [
+            "INSERT INTO exclude_inbounds_association (proxy_id, inbound_tag)
+             SELECT p.id, ml.inbound_tag
+             FROM marzhelp_limits ml
+             INNER JOIN users u ON u.admin_id = ml.admin_id
+             INNER JOIN proxies p ON p.user_id = u.id
+             LEFT JOIN exclude_inbounds_association eia
+               ON eia.proxy_id = p.id AND eia.inbound_tag = ml.inbound_tag
+             WHERE ml.type = 'exclude' AND eia.proxy_id IS NULL",
+            "DELETE eia FROM exclude_inbounds_association eia
+             INNER JOIN proxies p ON p.id = eia.proxy_id
+             INNER JOIN users u ON u.id = p.user_id
+             LEFT JOIN marzhelp_limits ml
+               ON ml.admin_id = u.admin_id
+              AND ml.inbound_tag = eia.inbound_tag
+              AND ml.type = 'exclude'
+             WHERE ml.admin_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM marzhelp_limits dedicated
+                   WHERE dedicated.type = 'dedicated'
+                     AND dedicated.inbound_tag = eia.inbound_tag
+                     AND dedicated.admin_id <> u.admin_id
+               )",
+            "INSERT INTO exclude_inbounds_association (proxy_id, inbound_tag)
+             SELECT p.id, ml.inbound_tag
+             FROM marzhelp_limits ml
+             INNER JOIN users u ON u.admin_id <> ml.admin_id
+             INNER JOIN proxies p ON p.user_id = u.id
+             LEFT JOIN exclude_inbounds_association eia
+               ON eia.proxy_id = p.id AND eia.inbound_tag = ml.inbound_tag
+             WHERE ml.type = 'dedicated' AND eia.proxy_id IS NULL",
+            "DELETE eia FROM exclude_inbounds_association eia
+             INNER JOIN proxies p ON p.id = eia.proxy_id
+             INNER JOIN users u ON u.id = p.user_id
+             INNER JOIN marzhelp_limits ml
+               ON ml.admin_id = u.admin_id
+              AND ml.inbound_tag = eia.inbound_tag
+              AND ml.type = 'dedicated'",
+        ];
+
+        foreach ($queries as $query) {
+            if (!$connection->query($query)) {
+                $this->dbMarzban->logError('Inbound limit sync failed: ' . $connection->error);
+                return false;
+            }
+        }
+        return true;
+    }
     
     public function managePanels() {
         global $marzbanAdminUsername;
+        $this->syncInboundLimits();
         $currentMinute = (int)date('i');
         $currentTime = date('H:i');
         $adminsResult = $this->dbMarzban->getConnection()->query("SELECT id FROM admins");
@@ -1195,7 +853,6 @@ class PanelManager {
         
             $this->managePanelExtension($adminId, $adminInfo);
             $this->manageTrafficUsage($adminId, $adminInfo);
-            $this->syncAdminEnforcement($adminId, $adminInfo);
 
             if ($currentTime === '00:00') {
                 $stmt = $this->dbMarzban->getConnection()->prepare("SELECT telegram_id, username FROM admins WHERE id = ?");
@@ -1211,7 +868,7 @@ class PanelManager {
                         $userLimit = isset($adminInfo['userLimit']) && $adminInfo['userLimit'] !== self::INFINITY ? (int)$adminInfo['userLimit'] : 0;
                         if ($userLimit > 0) {
                             $totalUsers = isset($adminInfo['userStats']['total_users']) ? (int)$adminInfo['userStats']['total_users'] : 0;
-                            $remainingSlots = $userLimit - $totalUsers;
+                            $remainingSlots = $userLimit;
         
                             if ($remainingSlots > 0 && $remainingSlots <= 5) {
                                 $lang = $this->getLang($telegramId);
@@ -1225,18 +882,11 @@ class PanelManager {
             }
         }
 
-        $this->dbMarzban->getConnection()->query(
-            "DELETE enforcement
-             FROM marzhelp_admin_enforcement enforcement
-             LEFT JOIN admins ON admins.id = enforcement.admin_id
-             WHERE admins.id IS NULL"
-        );
-    
         $this->notifyAdmins();
 
         if ($currentTime === '03:05') {
             $this->dbBot->getConnection()->query(
-                "DELETE FROM admin_usage
+                "DELETE FROM marzhelp_admin_usage
                  WHERE created_at < NOW() - INTERVAL 400 DAY"
             );
         }
@@ -1248,7 +898,7 @@ class PanelManager {
     
                 $usedTraffic = $adminInfo['usedTraffic'];
     
-                $stmt = $this->dbBot->getConnection()->prepare("INSERT INTO admin_usage (admin_id, used_traffic_gb) VALUES (?, ?)");
+                $stmt = $this->dbBot->getConnection()->prepare("INSERT INTO marzhelp_admin_usage (admin_id, used_traffic_gb) VALUES (?, ?)");
                 if ($stmt) {
                     $stmt->bind_param("id", $admin['id'], $usedTraffic);
                     $stmt->execute();

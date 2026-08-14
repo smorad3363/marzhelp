@@ -91,17 +91,29 @@ printf '%s\n' '-- mock database dump'
 MOCKDUMP
 cat > "${mock_bin}/mysql" <<'MOCKMYSQL'
 #!/usr/bin/env bash
-cat >/dev/null
+if [[ " $* " == *" -e "* ]]; then
+    printf 'smorad3363-marzban|1|9\n'
+else
+    cat >/dev/null
+fi
 MOCKMYSQL
 cat > "${mock_bin}/curl" <<'MOCKCURL'
 #!/usr/bin/env bash
 printf '%s\n' '{"ok":true}'
 MOCKCURL
+cat > "${mock_bin}/crontab" <<'MOCKCRON'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-l" ]]; then
+    exit 0
+fi
+cat >/dev/null
+MOCKCRON
 chmod +x \
     "${mock_bin}/php" \
     "${mock_bin}/mysqldump" \
     "${mock_bin}/mysql" \
-    "${mock_bin}/curl"
+    "${mock_bin}/curl" \
+    "${mock_bin}/crontab"
 
 PATH="${mock_bin}:${PATH}" \
 TEST_TABLE_MARKER="$table_marker" \

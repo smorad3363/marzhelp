@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 readonly MARZHELP_REPOSITORY="${MARZHELP_REPOSITORY:-https://github.com/smorad3363/marzhelp.git}"
-readonly MARZHELP_REF="${MARZHELP_REF:-${MARZHELP_BRANCH:-main}}"
+readonly MARZHELP_REF="${MARZHELP_REF:-${MARZHELP_BRANCH:-v2}}"
 readonly MARZHELP_DIRECTORY="${MARZHELP_DIRECTORY:-/var/www/html/marzhelp}"
 readonly CONFIG_FILE="${MARZHELP_DIRECTORY}/config.php"
 readonly BACKUP_ROOT="${MARZHELP_BACKUP_DIRECTORY:-/var/backups/marzhelp}"
@@ -66,7 +66,7 @@ write_mysql_client_file() {
     } > "$destination"
 }
 
-for required_command in git php mysqldump tar find stat openssl curl; do
+for required_command in git php mysql mysqldump tar find stat openssl curl; do
     require_command "$required_command"
 done
 
@@ -76,6 +76,38 @@ fi
 
 [[ -d "${MARZHELP_DIRECTORY}/.git" ]] || fail "MarzHelp Git checkout was not found at ${MARZHELP_DIRECTORY}"
 [[ -f "$CONFIG_FILE" ]] || fail "Existing configuration was not found at ${CONFIG_FILE}"
+
+# Compatibility is checked before backup creation, code reset, permission
+# changes, or any database write.
+bot_db_host="$(php_config_value botDbHost)"
+bot_db_user="$(php_config_value botDbUser)"
+bot_db_pass="$(php_config_value botDbPass)"
+bot_db_name="$(php_config_value botDbName)"
+vpn_db_host="$(php_config_value vpnDbHost)"
+vpn_db_user="$(php_config_value vpnDbUser)"
+vpn_db_pass="$(php_config_value vpnDbPass)"
+vpn_db_name="$(php_config_value vpnDbName)"
+migration_db_user="$(php_config_value_or_empty migrationDbUser)"
+migration_db_pass="$(php_config_value_or_empty migrationDbPass)"
+[[ "$bot_db_name" =~ ^[A-Za-z0-9_]+$ && "$vpn_db_name" =~ ^[A-Za-z0-9_]+$ ]] \
+    || fail "Database names must contain only letters, numbers, and underscores."
+
+compatibility_client_file="$(mktemp)"
+write_mysql_client_file "$compatibility_client_file" "$vpn_db_host" "$vpn_db_user" "$vpn_db_pass"
+compatibility="$(mysql --defaults-extra-file="$compatibility_client_file" -N -B "$vpn_db_name" -e "
+    SELECT CONCAT(
+      COALESCE(MAX(CASE WHEN \`key\`='source_id' THEN \`value\` END), ''), '|',
+      COALESCE(MAX(CASE WHEN \`key\`='schema_version' THEN \`value\` END), ''), '|',
+      (SELECT COUNT(*) FROM information_schema.tables
+       WHERE table_schema='${vpn_db_name}'
+         AND table_name IN ('marzhelp_metadata','marzhelp_admin_settings','marzhelp_user_states',
+           'marzhelp_user_temporaries','marzhelp_admin_usage','marzhelp_limits',
+           'marzhelp_runtime_settings','marzhelp_deleted_users','marzhelp_accounting_transactions'))
+    ) FROM marzhelp_metadata;
+" 2>/dev/null || true)"
+rm -f "$compatibility_client_file"
+[[ "$compatibility" == "smorad3363-marzban|1|9" ]] \
+    || fail "Incompatible Marzban. Required: smorad3363/Marzban v4 with MarzHelp schema 1; found '${compatibility:-no marker}'."
 
 application_owner_id="$(stat -c '%u' "$MARZHELP_DIRECTORY")"
 application_group_id="$(stat -c '%g' "$MARZHELP_DIRECTORY")"
@@ -103,17 +135,6 @@ tar \
     --exclude='.git' \
     -czf "${backup_directory}/application.tar.gz" \
     -C "$MARZHELP_DIRECTORY" .
-
-bot_db_host="$(php_config_value botDbHost)"
-bot_db_user="$(php_config_value botDbUser)"
-bot_db_pass="$(php_config_value botDbPass)"
-bot_db_name="$(php_config_value botDbName)"
-vpn_db_host="$(php_config_value vpnDbHost)"
-vpn_db_user="$(php_config_value vpnDbUser)"
-vpn_db_pass="$(php_config_value vpnDbPass)"
-vpn_db_name="$(php_config_value vpnDbName)"
-migration_db_user="$(php_config_value_or_empty migrationDbUser)"
-migration_db_pass="$(php_config_value_or_empty migrationDbPass)"
 
 if [[ -n "$migration_db_user" && -n "$migration_db_pass" ]]; then
     bot_dump_user="$migration_db_user"
@@ -144,12 +165,16 @@ mysqldump \
     --skip-lock-tables \
     --no-tablespaces \
     "$bot_db_name" > "${backup_directory}/marzhelp.sql"
-mysqldump \
-    --defaults-extra-file="$vpn_client_file" \
-    --single-transaction \
-    --skip-lock-tables \
-    --no-tablespaces \
-    "$vpn_db_name" > "${backup_directory}/marzban.sql"
+if [[ "$bot_db_host" != "$vpn_db_host" || "$bot_db_name" != "$vpn_db_name" ]]; then
+    mysqldump \
+        --defaults-extra-file="$vpn_client_file" \
+        --single-transaction \
+        --skip-lock-tables \
+        --no-tablespaces \
+        "$vpn_db_name" > "${backup_directory}/marzban.sql"
+else
+    cp "${backup_directory}/marzhelp.sql" "${backup_directory}/marzban.sql"
+fi
 rm -f "$bot_client_file" "$vpn_client_file"
 trap - EXIT
 
@@ -255,15 +280,12 @@ if [[ "$effective_vpn_user" == "root" || "$effective_bot_user" == "root" ]]; the
     mysql --defaults-extra-file="$migration_client_file" <<SQL
 CREATE USER IF NOT EXISTS '${effective_vpn_user}'@'localhost' IDENTIFIED BY '${effective_vpn_pass}';
 ALTER USER '${effective_vpn_user}'@'localhost' IDENTIFIED BY '${effective_vpn_pass}';
-GRANT SELECT, INSERT, UPDATE, DELETE ON \`${bot_db_name}\`.* TO '${effective_vpn_user}'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON \`${vpn_db_name}\`.* TO '${effective_vpn_user}'@'localhost';
 
 CREATE USER IF NOT EXISTS '${migration_user}'@'localhost' IDENTIFIED BY '${migration_pass}';
 ALTER USER '${migration_user}'@'localhost' IDENTIFIED BY '${migration_pass}';
-GRANT ALL PRIVILEGES ON \`${bot_db_name}\`.* TO '${migration_user}'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, TRIGGER, EVENT, REFERENCES
-  ON \`${vpn_db_name}\`.* TO '${migration_user}'@'localhost';
-SET GLOBAL event_scheduler = ON;
+GRANT SELECT ON \`${bot_db_name}\`.* TO '${migration_user}'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON \`${vpn_db_name}\`.* TO '${migration_user}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
     rm -f "$migration_client_file"
@@ -274,10 +296,7 @@ cat > "${MARZHELP_DIRECTORY}/config.local.php" <<PHP
 \$webhookSecret = '${webhook_secret}';
 \$allowSystemCommands = false;
 \$storagePath = '/var/lib/marzhelp';
-\$botDbHost = 'localhost';
-\$botDbUser = '${effective_bot_user}';
-\$botDbPass = '${effective_bot_pass}';
-\$vpnDbHost = 'localhost';
+\$vpnDbHost = '${vpn_db_host}';
 \$vpnDbUser = '${effective_vpn_user}';
 \$vpnDbPass = '${effective_vpn_pass}';
 \$migrationDbUser = '${migration_user}';
@@ -286,12 +305,7 @@ PHP
 
 if [[ "$(id -u)" -eq 0 ]]; then
     install -d -o www-data -g www-data -m 750 /var/lib/marzhelp
-    install -d -o root -g root -m 755 /etc/mysql/conf.d
-    cat > /etc/mysql/conf.d/marzhelp.cnf <<'EOF'
-[mysqld]
-event_scheduler=ON
-EOF
-    chmod 644 /etc/mysql/conf.d/marzhelp.cnf
+    rm -f /etc/mysql/conf.d/marzhelp.cnf
     rm -f /etc/sudoers.d/marzhelp
     if [[ -f /usr/local/bin/marzban ]]; then
         chown root:root /usr/local/bin/marzban
@@ -304,8 +318,22 @@ while IFS= read -r -d '' php_file; do
     php -l "$php_file" >/dev/null
 done < <(find "$MARZHELP_DIRECTORY" -name '*.php' -type f -print0)
 
-log "Applying database migrations and cron configuration."
+log "Verifying schema and importing legacy data when required."
 php "${MARZHELP_DIRECTORY}/table.php"
+
+# After a successful, row-count-validated import, both connections use the
+# canonical Marzban database. The legacy database remains untouched/obsolete.
+cat >> "${MARZHELP_DIRECTORY}/config.local.php" <<PHP
+\$botDbHost = '${vpn_db_host}';
+\$botDbUser = '${effective_vpn_user}';
+\$botDbPass = '${effective_vpn_pass}';
+\$botDbName = '${vpn_db_name}';
+\$vpnDbName = '${vpn_db_name}';
+PHP
+
+cron_job="* * * * * php ${MARZHELP_DIRECTORY}/crons/cron.php >/dev/null 2>&1"
+({ crontab -l 2>/dev/null | grep -Fv "${MARZHELP_DIRECTORY}/crons/cron.php" || true; };
+    echo "$cron_job") | crontab -
 
 bot_token="$(php_config_value botToken)"
 bot_domain="$(php_config_value botdomain)"

@@ -14,6 +14,7 @@ if (php_sapi_name() !== 'cli') {
 
 require_once 'app/classes/marzban.php';
 require_once 'app/functions/keyboards.php';
+require_once 'app/functions/admin_pagination.php';
 require_once 'app/security.php';
 require_once 'app/bootstrap.php';
 
@@ -22,7 +23,7 @@ if (is_dir($runtimeStoragePath) && is_writable($runtimeStoragePath)) {
     chdir($runtimeStoragePath);
 }
 
-$latestVersion = 'v0.2.8';
+$latestVersion = 'v2';
 
 $marzbanapi = new MarzbanAPI($marzbanUrl, $marzbanAdminUsername, $marzbanAdminPassword);
 
@@ -59,7 +60,7 @@ function getLang($userId) {
 
     $langCode = 'en'; 
 
-    if ($stmt = $botConn->prepare("SELECT lang FROM user_states WHERE user_id = ?")) {
+    if ($stmt = $botConn->prepare("SELECT lang FROM marzhelp_user_states WHERE user_id = ?")) {
         $stmt->bind_param("i", $userId);
         
         if ($stmt->execute()) {
@@ -111,7 +112,7 @@ function sendRequest($method, $parameters) {
         $messageId = $result['result']['message_id'];
         $userId = $parameters['chat_id'];
 
-        $stmt = $botConn->prepare("UPDATE user_states SET message_id = ? WHERE user_id = ?");
+        $stmt = $botConn->prepare("UPDATE marzhelp_user_states SET message_id = ? WHERE user_id = ?");
         $stmt->bind_param("ii", $messageId, $userId);
         $stmt->execute();
         $stmt->close();
@@ -142,23 +143,25 @@ function sendRequest($method, $parameters) {
 }
 
 function triggerCheck($connection, $triggerName, $adminId) {
-    $preventFlag = false;
-    $triggerExistsResult = $connection->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-    if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-        $triggerResult = $connection->query("SHOW CREATE TRIGGER `$triggerName`");
-        if ($triggerResult && $triggerResult->num_rows > 0) {
-            $triggerRow = $triggerResult->fetch_assoc();
-            $triggerBody = $triggerRow['SQL Original Statement'];
-            if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                $adminIdsStr = str_replace(' ', '', $matches[1]);
-                $adminIds = explode(',', $adminIdsStr);
-                if (in_array($adminId, $adminIds)) {
-                    $preventFlag = true;
-                }
-            }
-        }
+    $columns = [
+        'prevent_user_creation' => 'prevent_user_creation',
+        'admin_delete' => 'prevent_user_deletion',
+        'prevent_User_Reset_Usage' => 'prevent_user_reset',
+        'prevent_revoke_subscription' => 'prevent_revoke_subscription',
+        'prevent_unlimited_traffic' => 'prevent_unlimited_traffic',
+    ];
+    if (!isset($columns[$triggerName])) {
+        return false;
     }
-    return $preventFlag;
+    $column = $columns[$triggerName];
+    $statement = $connection->prepare(
+        "SELECT `$column` FROM marzhelp_admin_settings WHERE admin_id = ?"
+    );
+    $statement->bind_param('i', $adminId);
+    $statement->execute();
+    $row = $statement->get_result()->fetch_assoc();
+    $statement->close();
+    return !empty($row[$column]);
 }
 
 function generateRandomPassword($length = 12) {
@@ -180,7 +183,7 @@ function createAdmin($userId, $chatId) {
     $isSudo = handleTemporaryData('get', $userId, 'new_admin_sudo') ?? 0;
     $telegramId = handleTemporaryData('get', $userId, 'new_admin_telegram_id') ?? 0;
     $nothashedpassword = handleTemporaryData('get', $userId, 'new_admin_password_nothashed');
-     $stmt = $botConn->prepare("SELECT state, admin_id, message_id FROM user_states WHERE user_id = ?");
+     $stmt = $botConn->prepare("SELECT state, admin_id, message_id FROM marzhelp_user_states WHERE user_id = ?");
     $stmt->bind_param("i", $userId);
     $stmt->execute();
     $userStateResult = $stmt->get_result();
@@ -250,12 +253,12 @@ function handleUserState($action, $userId, $state = null, $adminId = null) {
 
     if ($action === 'set') {
         if ($adminId !== null) {
-            $sql = "INSERT INTO user_states (user_id, state, admin_id) VALUES (?, ?, ?) 
+            $sql = "INSERT INTO marzhelp_user_states (user_id, state, admin_id) VALUES (?, ?, ?)
                     ON DUPLICATE KEY UPDATE state = ?, admin_id = ?";
             $stmt = $botConn->prepare($sql);
             $stmt->bind_param("isisi", $userId, $state, $adminId, $state, $adminId);
         } else {
-            $sql = "INSERT INTO user_states (user_id, state) VALUES (?, ?) 
+            $sql = "INSERT INTO marzhelp_user_states (user_id, state) VALUES (?, ?)
                     ON DUPLICATE KEY UPDATE state = ?";
             $stmt = $botConn->prepare($sql);
             $stmt->bind_param("iss", $userId, $state, $state);
@@ -271,7 +274,7 @@ function handleUserState($action, $userId, $state = null, $adminId = null) {
         return true;
 
     } elseif ($action === 'get') {
-        $stmt = $botConn->prepare("SELECT state, admin_id, message_id FROM user_states WHERE user_id = ?");
+        $stmt = $botConn->prepare("SELECT state, admin_id, message_id FROM marzhelp_user_states WHERE user_id = ?");
         $stmt->bind_param("i", $userId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -294,7 +297,7 @@ function handleUserState($action, $userId, $state = null, $adminId = null) {
         ];
 
     } elseif ($action === 'clear') {
-        $stmt = $botConn->prepare("UPDATE user_states SET state = NULL WHERE user_id = ?");
+        $stmt = $botConn->prepare("UPDATE marzhelp_user_states SET state = NULL WHERE user_id = ?");
         $stmt->bind_param("i", $userId);
         $stmt->execute();
         $stmt->close();
@@ -308,14 +311,14 @@ function handleTemporaryData($operation, $userId, $key = null, $value = null) {
     global $botConn;
 
     if ($operation === 'set') {
-        $stmt = $botConn->prepare("INSERT INTO user_temporaries (user_id, `user_key`, `value`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `value` = ?");
+        $stmt = $botConn->prepare("INSERT INTO marzhelp_user_temporaries (user_id, `user_key`, `value`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `value` = ?");
         $stmt->bind_param("isss", $userId, $key, $value, $value);
         if (!$stmt->execute()) {
             file_put_contents('logs.txt', date('Y-m-d H:i:s') . " - SQL error: " . $stmt->error . "\n", FILE_APPEND);
         }
         $stmt->close();
     } elseif ($operation === 'get') {
-        $stmt = $botConn->prepare("SELECT `value` FROM user_temporaries WHERE user_id = ? AND `user_key` = ?");
+        $stmt = $botConn->prepare("SELECT `value` FROM marzhelp_user_temporaries WHERE user_id = ? AND `user_key` = ?");
         $stmt->bind_param("is", $userId, $key);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -326,7 +329,7 @@ function handleTemporaryData($operation, $userId, $key = null, $value = null) {
         $stmt->close();
         return $retrievedValue;
     } elseif ($operation === 'clear') {
-        $stmt = $botConn->prepare("DELETE FROM user_temporaries WHERE user_id = ?");
+        $stmt = $botConn->prepare("DELETE FROM marzhelp_user_temporaries WHERE user_id = ?");
         $stmt->bind_param("i", $userId);
         $stmt->execute();
         $stmt->close();
@@ -336,7 +339,7 @@ function handleTemporaryData($operation, $userId, $key = null, $value = null) {
 function setUserTemplateIndex($userId, $index) {
     global $botConn;
 
-    $stmt = $botConn->prepare("INSERT INTO user_states (user_id, template_index) VALUES (?, ?) ON DUPLICATE KEY UPDATE template_index = ?");
+    $stmt = $botConn->prepare("INSERT INTO marzhelp_user_states (user_id, template_index) VALUES (?, ?) ON DUPLICATE KEY UPDATE template_index = ?");
     $stmt->bind_param("iii", $userId, $index, $index);
     $stmt->execute();
     $stmt->close();
@@ -344,7 +347,7 @@ function setUserTemplateIndex($userId, $index) {
 function getUserTemplateIndex($userId) {
     global $botConn;
 
-    $stmt = $botConn->prepare("SELECT template_index FROM user_states WHERE user_id = ?");
+    $stmt = $botConn->prepare("SELECT template_index FROM marzhelp_user_states WHERE user_id = ?");
     $stmt->bind_param("i", $userId);
     $stmt->execute();
     $stmt->bind_result($templateIndex);
@@ -374,79 +377,6 @@ function manageEventBasedOnLimits($interval = 1) {
     $statement->bind_param('ss', $settingName, $settingValue);
     $statement->execute();
     $statement->close();
-    return;
-
-    $eventName = 'manage_inbound_limits';
-    $countResult = $marzbanConn->query("SELECT COUNT(*) as count FROM marzhelp_limits");
-    if (!$countResult) {
-        logDebug("Error in COUNT query: " . $marzbanConn->error);
-        return;
-    }
-    $count = $countResult->fetch_assoc()['count'];
-
-    if ($count > 0) {
-        $marzbanConn->query("DROP EVENT IF EXISTS `$eventName`");
-        if ($marzbanConn->error) {
-            logDebug("Error dropping event: " . $marzbanConn->error);
-            return;
-        }
-
-        $createEvent = $marzbanConn->query("
-            CREATE EVENT `$eventName`
-            ON SCHEDULE EVERY $interval SECOND
-            DO
-            BEGIN
-                INSERT INTO exclude_inbounds_association (proxy_id, inbound_tag)
-                SELECT p.id, ml.inbound_tag
-                FROM marzhelp_limits ml
-                INNER JOIN admins a ON ml.admin_id = a.id
-                INNER JOIN users u ON u.admin_id = a.id
-                INNER JOIN proxies p ON p.user_id = u.id
-                LEFT JOIN exclude_inbounds_association eia 
-                    ON eia.proxy_id = p.id AND eia.inbound_tag = ml.inbound_tag
-                WHERE ml.type = 'exclude'
-                AND eia.proxy_id IS NULL;
-
-                DELETE eia
-                FROM exclude_inbounds_association eia
-                INNER JOIN proxies p ON eia.proxy_id = p.id
-                INNER JOIN users u ON p.user_id = u.id
-                INNER JOIN admins a ON u.admin_id = a.id
-                LEFT JOIN marzhelp_limits ml 
-                    ON ml.admin_id = a.id AND ml.inbound_tag = eia.inbound_tag AND ml.type = 'exclude'
-                WHERE ml.admin_id IS NULL;
-
-                INSERT INTO exclude_inbounds_association (proxy_id, inbound_tag)
-                SELECT p.id, ml.inbound_tag
-                FROM marzhelp_limits ml
-                INNER JOIN admins a ON a.id != ml.admin_id
-                INNER JOIN users u ON u.admin_id = a.id
-                INNER JOIN proxies p ON p.user_id = u.id
-                LEFT JOIN exclude_inbounds_association eia 
-                    ON eia.proxy_id = p.id AND eia.inbound_tag = ml.inbound_tag
-                WHERE ml.type = 'dedicated'
-                AND eia.proxy_id IS NULL;
-
-                DELETE eia
-                FROM exclude_inbounds_association eia
-                INNER JOIN proxies p ON eia.proxy_id = p.id
-                INNER JOIN users u ON p.user_id = u.id
-                INNER JOIN admins a ON u.admin_id = a.id
-                INNER JOIN marzhelp_limits ml 
-                    ON ml.admin_id = a.id AND ml.inbound_tag = eia.inbound_tag AND ml.type = 'dedicated';
-            END;
-        ");
-        if ($marzbanConn->error) {
-            logDebug("Error creating event: " . $marzbanConn->error);
-            return;
-        }
-    } else {
-        $marzbanConn->query("DROP EVENT IF EXISTS `$eventName`");
-        if ($marzbanConn->error) {
-            logDebug("Error dropping event when count=0: " . $marzbanConn->error);
-            return;
-        }
-    }
     logDebug("manageEventBasedOnLimits completed");
 }
 
@@ -472,13 +402,14 @@ function getAdminInfo($adminId) {
             expiry_date,
             status,
             user_limit,
+            max_user_duration_days,
             calculate_volume,
             prevent_user_creation,
             prevent_user_deletion,
             prevent_user_reset,
             prevent_revoke_subscription,
             prevent_unlimited_traffic
-         FROM admin_settings
+         FROM marzhelp_admin_settings
          WHERE admin_id = ?"
     );
     $stmtSettings->bind_param("i", $adminId);
@@ -542,10 +473,7 @@ function getAdminInfo($adminId) {
                 +
                 (
                     SELECT IFNULL(SUM(
-                        COALESCE(
-                            marzhelp_deleted_users.allocated_traffic,
-                            marzhelp_deleted_users.used_traffic_total
-                        )
+                        marzhelp_deleted_users.used_traffic_total
                     ), 0)
                     FROM marzhelp_deleted_users
                     WHERE marzhelp_deleted_users.admin_id = admins.id
@@ -597,7 +525,10 @@ function getAdminInfo($adminId) {
     $stmtUserStats->close();
 
     $userLimit = isset($settings['user_limit']) ? $settings['user_limit'] : '♾️';
-    $remainingUserLimit = ($userLimit !== '♾️') ? $userLimit - $userStats['total_users'] : '♾️';
+    $remainingUserLimit = $userLimit;
+    $maxUserDurationDays = isset($settings['max_user_duration_days'])
+        ? (int)$settings['max_user_duration_days']
+        : null;
 
     $preventUserCreation = !empty($settings['prevent_user_creation']);
     $preventUserReset = !empty($settings['prevent_user_reset']);
@@ -616,6 +547,7 @@ function getAdminInfo($adminId) {
         'status' => $status,
         'userLimit' => $userLimit,
         'remainingUserLimit' => $remainingUserLimit,
+        'maxUserDurationDays' => $maxUserDurationDays,
         'preventUserReset' => $preventUserReset,
         'preventUserCreation' => $preventUserCreation,
         'preventUserDeletion' => $preventUserDelete,
@@ -650,8 +582,11 @@ function getAdminInfoText($adminInfo, $userId) {
     $daysText = ($adminInfo['daysLeft'] !== $lang['unlimited']) ? "`{$adminInfo['daysLeft']}` {$lang['days']}" : $lang['unlimited'];
     
     $remainingUserLimit = ($adminInfo['remainingUserLimit'] !== $lang['unlimited']) ? "{$adminInfo['remainingUserLimit']}" : $lang['unlimited'];
+    $maxDurationText = $adminInfo['maxUserDurationDays'] === null
+        ? $lang['unlimited']
+        : $adminInfo['maxUserDurationDays'] . ' ' . $lang['days'];
     
-    $stmt = $botConn->prepare("SELECT lang FROM user_states WHERE user_id = ?");
+    $stmt = $botConn->prepare("SELECT lang FROM marzhelp_user_states WHERE user_id = ?");
     $stmt->bind_param("i", $userId);
     $stmt->execute();
     $result = $stmt->get_result();
@@ -673,6 +608,7 @@ function getAdminInfoText($adminInfo, $userId) {
     $infoText .= "📥 **{$lang['usedTraffic']}:** `" . number_format($adminInfo['usedTraffic'], 2) . "` {$lang['createAdmin_traffic_gb']}\n";
     $infoText .= $separator . "\n"; 
     $infoText .= "👥 **{$lang['adminInfoText_userCreationLimit']}** `{$remainingUserLimit}`\n";
+    $infoText .= "📅 **{$lang['max_duration_label']}** `{$maxDurationText}`\n";
     $infoText .= "⏳ **{$lang['expiryDate']}:** {$daysText} \n";
     $infoText .= $separator . "\n";    
 
@@ -686,6 +622,46 @@ function getAdminInfoText($adminInfo, $userId) {
 
    
     return $infoText . $userStatsText;
+}
+
+/**
+ * Apply bulk plan changes through Marzban's API so every user passes the
+ * canonical quota, allowance, unlimited-traffic, and duration policy.
+ */
+function modifyAdminUsersViaApi($adminId, $field, $delta) {
+    global $marzbanConn, $marzbanapi;
+
+    if (!in_array($field, ['data_limit', 'expire'], true)) {
+        throw new InvalidArgumentException('Unsupported bulk user field');
+    }
+
+    $stmt = $marzbanConn->prepare(
+        "SELECT username, data_limit, expire FROM users WHERE admin_id = ? AND {$field} IS NOT NULL ORDER BY id"
+    );
+    $stmt->bind_param('i', $adminId);
+    $stmt->execute();
+    $users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    $result = ['succeeded' => 0, 'failed' => 0, 'errors' => []];
+    foreach ($users as $user) {
+        $current = (int)$user[$field];
+        $target = $current + (int)$delta;
+        if ($field === 'data_limit') {
+            // Zero is Marzban's unlimited sentinel; a subtraction must never
+            // accidentally turn a finite account into an unlimited one.
+            $target = max($target, 1);
+        }
+        try {
+            $marzbanapi->modifyUser($user['username'], [$field => $target]);
+            $result['succeeded']++;
+        } catch (Throwable $exception) {
+            $result['failed']++;
+            $result['errors'][] = $user['username'] . ': ' . $exception->getMessage();
+        }
+    }
+
+    return $result;
 }
 
 function autoCreateAdmin($chatId) {
@@ -923,7 +899,7 @@ function handleCallbackQuery($callback_query) {
 
         $adminId = (int)substr($data, strlen($callbackPrefix));
         $toggle = $botConn->prepare(
-            "INSERT INTO admin_settings (admin_id, `$columnName`)
+            "INSERT INTO marzhelp_admin_settings (admin_id, `$columnName`)
              VALUES (?, 1)
              ON DUPLICATE KEY UPDATE `$columnName` = 1 - `$columnName`"
         );
@@ -932,22 +908,13 @@ function handleCallbackQuery($callback_query) {
         $toggle->close();
 
         $readValue = $botConn->prepare(
-            "SELECT `$columnName` FROM admin_settings WHERE admin_id = ?"
+            "SELECT `$columnName` FROM marzhelp_admin_settings WHERE admin_id = ?"
         );
         $readValue->bind_param('i', $adminId);
         $readValue->execute();
         $restrictionRow = $readValue->get_result()->fetch_assoc();
         $restrictionValue = (int)$restrictionRow[$columnName];
         $readValue->close();
-
-        $syncValue = $marzbanConn->prepare(
-            "INSERT INTO marzhelp_admin_enforcement (admin_id, `$columnName`)
-             VALUES (?, ?)
-             ON DUPLICATE KEY UPDATE `$columnName` = VALUES(`$columnName`)"
-        );
-        $syncValue->bind_param('ii', $adminId, $restrictionValue);
-        $syncValue->execute();
-        $syncValue->close();
 
         $adminInfo = getAdminInfo($adminId);
         sendRequest('editMessageText', [
@@ -1046,74 +1013,6 @@ function handleCallbackQuery($callback_query) {
         ]);
     }
     
-    if (strpos($data, 'toggle_prevent_revoke_subscription:') === 0) {
-        $adminId = intval(substr($data, strlen('toggle_prevent_revoke_subscription:')));
-    
-        $triggerName = 'prevent_revoke_subscription';
-    
-        $triggerExistsResult = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $adminIds = [];
-        if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-            $triggerResult = $marzbanConn->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                }
-            }
-        }
-    
-        if (in_array($adminId, $adminIds)) {
-            $adminIds = array_diff($adminIds, [$adminId]);
-        } else {
-            $adminIds[] = $adminId;
-        }
-    
-        if (empty($adminIds)) {
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        } else {
-            $adminIdsStr = implode(', ', $adminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE UPDATE ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF OLD.admin_id IN ($adminIdsStr) AND NEW.sub_revoked_at <> OLD.sub_revoked_at THEN
-                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Revoking subscription is not allowed';
-                END IF;
-            END;
-            ";
-    
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-            $marzbanConn->query($triggerBody);
-        }
-    
-        $adminInfo = getAdminInfo($adminId, $userId);
-        if (!$adminInfo) {
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['callbackResponse_adminNotFound']
-            ]);
-            return;
-        }
-    
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'text' => $lang['callbackResponse_showRestrictions'],
-            'reply_markup' => getRestrictionsKeyboard(
-                $adminId, 
-                $adminInfo['preventUserDeletion'], 
-                $adminInfo['preventUserCreation'], 
-                $adminInfo['preventUserReset'], 
-                $adminInfo['preventRevokeSubscription'], 
-                $adminInfo['preventUnlimitedTraffic'],
-                $userId
-            )
-        ]);
-    }
     if (strpos($data, 'set_user_limit:') === 0) {
         $adminId = intval(substr($data, strlen('set_user_limit:')));
         
@@ -1150,7 +1049,7 @@ function handleCallbackQuery($callback_query) {
         $adminId = intval($adminId);
         $userLimit = intval($userLimit);
         
-        $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, user_limit) VALUES (?, ?) ON DUPLICATE KEY UPDATE user_limit = ?");
+        $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, user_limit) VALUES (?, ?) ON DUPLICATE KEY UPDATE user_limit = ?");
         $stmt->bind_param("iii", $adminId, $userLimit, $userLimit);
         $stmt->execute();
         $stmt->close();
@@ -1213,250 +1112,195 @@ function handleCallbackQuery($callback_query) {
     
         return;
     }
-    if (strpos($data, 'toggle_prevent_user_creation:') === 0) {
-        $adminId = intval(substr($data, strlen('toggle_prevent_user_creation:')));
-    
-        $triggerName = 'prevent_user_creation';
-    
-        $triggerExistsResult = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $adminIds = [];
-        if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-            $triggerResult = $marzbanConn->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                }
-            }
+    if ($data === 'manage_admins' || strpos($data, 'manage_admins:') === 0) {
+        global $marzbanAdminUsername;
+        $requestedPage = 0;
+        if (strpos($data, 'manage_admins:') === 0) {
+            $requestedPage = (int)substr($data, strlen('manage_admins:'));
         }
-    
-        if (in_array($adminId, $adminIds)) {
-            $adminIds = array_diff($adminIds, [$adminId]);
-        } else {
-            $adminIds[] = $adminId;
+        if ($requestedPage < 1) {
+            $requestedPage = (int)(handleTemporaryData('get', $userId, 'admin_list_page') ?: 1);
         }
-    
-        if (empty($adminIds)) {
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        } else {
-            $adminIdsStr = implode(', ', $adminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE INSERT ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF NEW.admin_id IN ($adminIdsStr) THEN
-                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'User creation not allowed for this admin ID.';
-                END IF;
-            END;
-            ";
-    
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-            $marzbanConn->query($triggerBody);
-        }
-    
-        $adminInfo = getAdminInfo($adminId, $userId);
-        if (!$adminInfo) {
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['callbackResponse_adminNotFound']
-            ]);
-            return;
-        }
-        $adminInfo['adminId'] = $adminId;
-        $infoText = getAdminInfoText($adminInfo, $userId);
 
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'text' => $lang['callbackResponse_showRestrictions'],
-            'parse_mode' => 'Markdown',
-            'reply_markup' => getRestrictionsKeyboard(
-                $adminId, 
-                $adminInfo['preventUserDeletion'], 
-                $adminInfo['preventUserCreation'], 
-                $adminInfo['preventUserReset'], 
-                $adminInfo['preventRevokeSubscription'], 
-                $adminInfo['preventUnlimitedTraffic'],
-                $userId
-            )
-        ]);
-    }
-    if (strpos($data, 'toggle_prevent_unlimited_traffic:') === 0) {
-        $adminId = intval(substr($data, strlen('toggle_prevent_unlimited_traffic:')));
-    
-        $triggerName = 'prevent_unlimited_traffic';
-    
-        $triggerExistsResult = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $adminIds = [];
-        if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-            $triggerResult = $marzbanConn->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                }
-            }
-        }
-        if (in_array($adminId, $adminIds)) {
-            $adminIds = array_diff($adminIds, [$adminId]);
-        } else {
-            $adminIds[] = $adminId;
-        }
-        if (empty($adminIds)) {
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        } else {
-            $adminIdsStr = implode(', ', $adminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE UPDATE ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF NEW.data_limit IS NULL AND NEW.admin_id IN ($adminIdsStr) THEN
-                    SIGNAL SQLSTATE '45000' 
-                    SET MESSAGE_TEXT = 'Admins with these IDs cannot create users with unlimited traffic.';
-                END IF;
-            END;
-        ";
-    
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-            $marzbanConn->query($triggerBody);
-        }
-        $adminInfo = getAdminInfo($adminId, $userId);
-        if (!$adminInfo) {
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['callbackResponse_adminNotFound']
-            ]);
-            return;
-        }
-        $adminInfo['adminId'] = $adminId;
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'text' => $lang['callbackResponse_showRestrictions'],
-            'reply_markup' => getRestrictionsKeyboard(
-                $adminId, 
-                $adminInfo['preventUserDeletion'], 
-                $adminInfo['preventUserCreation'], 
-                $adminInfo['preventUserReset'], 
-                $adminInfo['preventRevokeSubscription'], 
-                $adminInfo['preventUnlimitedTraffic'],
-                $userId
-            )
-        ]);
-    }
-        if ($data === 'manage_admins') {
-        global $marzbanAdminUsername; 
         if (in_array($userId, $allowedUsers)) {
-            $adminsResult = $marzbanConn->query("SELECT id, username FROM admins");
+            $countStatement = $marzbanConn->prepare('SELECT COUNT(*) AS total FROM admins WHERE username <> ?');
+            $countStatement->bind_param('s', $marzbanAdminUsername);
         } else {
-            $stmt = $marzbanConn->prepare("SELECT id, username FROM admins WHERE telegram_id = ?");
-            $stmt->bind_param("i", $userId);
-            $stmt->execute();
-            $adminsResult = $stmt->get_result();
+            $countStatement = $marzbanConn->prepare(
+                'SELECT COUNT(*) AS total FROM admins WHERE telegram_id = ? AND username <> ?'
+            );
+            $countStatement->bind_param('is', $userId, $marzbanAdminUsername);
         }
+        $countStatement->execute();
+        $total = (int)$countStatement->get_result()->fetch_assoc()['total'];
+        $countStatement->close();
+        $pagination = marzhelpNormalizeAdminPage($requestedPage, $total);
 
-        $admins = [];
+        if (in_array($userId, $allowedUsers)) {
+            $adminsStatement = $marzbanConn->prepare(
+                'SELECT id, username FROM admins WHERE username <> ? ORDER BY username ASC, id ASC LIMIT ? OFFSET ?'
+            );
+            $adminsStatement->bind_param(
+                'sii', $marzbanAdminUsername, $pagination['limit'], $pagination['offset']
+            );
+        } else {
+            $adminsStatement = $marzbanConn->prepare(
+                'SELECT id, username FROM admins WHERE telegram_id = ? AND username <> ? '
+                . 'ORDER BY username ASC, id ASC LIMIT ? OFFSET ?'
+            );
+            $adminsStatement->bind_param(
+                'isii', $userId, $marzbanAdminUsername, $pagination['limit'], $pagination['offset']
+            );
+        }
+        $adminsStatement->execute();
+        $adminsResult = $adminsStatement->get_result();
+        $rows = [];
         while ($row = $adminsResult->fetch_assoc()) {
-            if ($row['username'] === $marzbanAdminUsername) {
+            $adminInfo = getAdminInfo((int)$row['id']);
+            if (!$adminInfo) {
                 continue;
             }
-            $adminInfo = getAdminInfo($row['id']);
-            if ($adminInfo) {
-                $remainingTraffic = $adminInfo['remainingTraffic'] === '♾️' ? 'نامحدود' : number_format($adminInfo['remainingTraffic'], 2) . ' گیگ';
-                $daysLeft = $adminInfo['daysLeft'] === '♾️' ? 'نامحدود' : $adminInfo['daysLeft'] . ' روز';
-                $admins[] = [
-                    ['text' => $daysLeft, 'callback_data' => 'select_admin:' . $row['id']],
-                    ['text' => $remainingTraffic, 'callback_data' => 'select_admin:' . $row['id']],
-                    ['text' => $row['username'], 'callback_data' => 'select_admin:' . $row['id']]
-                ];
-            }
-        }
-
-        if (empty($admins)) {
-            $stmt = $botConn->prepare("UPDATE user_states SET state = NULL WHERE user_id = ?");
-            $stmt->bind_param("i", $chatId);
-            $stmt->execute();
-            $stmt->close();
-
-            $keyboard = [
-                'inline_keyboard' => [
-                    [
-                        ['text' => $lang['back'], 'callback_data' => 'back_to_main']
-                    ]
-                ]
+            $remainingTraffic = $adminInfo['remainingTraffic'] === '♾️'
+                ? 'نامحدود' : number_format($adminInfo['remainingTraffic'], 2) . ' گیگ';
+            $daysLeft = $adminInfo['daysLeft'] === '♾️'
+                ? 'نامحدود' : $adminInfo['daysLeft'] . ' روز';
+            $callback = 'select_admin:' . $row['id'] . ':' . $pagination['page'];
+            $rows[] = [
+                ['text' => $daysLeft, 'callback_data' => $callback],
+                ['text' => $remainingTraffic, 'callback_data' => $callback],
+                ['text' => $row['username'], 'callback_data' => $callback],
             ];
-
-            sendRequest('editMessageText', [
-                'chat_id' => $chatId,
-                'message_id' => $messageId,
-                'text' => $lang['no_admins'],
-                'reply_markup' => $keyboard
-            ]);
-            return;
         }
+        $adminsStatement->close();
+        handleTemporaryData('set', $userId, 'admin_list_page', (string)$pagination['page']);
 
-        $keyboard = [
-            'inline_keyboard' => [
-                [
-                    ['text' => 'زمان باقی‌مانده', 'callback_data' => 'noop'],
-                    ['text' => 'حجم باقی‌مانده', 'callback_data' => 'noop'],
-                    ['text' => 'یوزرنیم', 'callback_data' => 'noop']
-                ]
-            ]
-        ];
-
-        $keyboard['inline_keyboard'] = array_merge($keyboard['inline_keyboard'], $admins);
-
+        $keyboardRows = [];
+        if ($total > 0) {
+            $keyboardRows[] = [
+                ['text' => 'زمان باقی‌مانده', 'callback_data' => 'noop'],
+                ['text' => 'حجم باقی‌مانده', 'callback_data' => 'noop'],
+                ['text' => 'یوزرنیم', 'callback_data' => 'noop'],
+            ];
+            $keyboardRows = array_merge($keyboardRows, $rows);
+            $keyboardRows[] = marzhelpAdminPaginationRow(
+                $pagination['page'], $pagination['pages'], $lang
+            );
+        }
         if (in_array($userId, $allowedUsers)) {
-            $keyboard['inline_keyboard'][] = [
+            $keyboardRows[] = [
                 ['text' => $lang['add_admin'], 'callback_data' => 'add_admin'],
-                ['text' => $lang['delete_admin'], 'callback_data' => 'delete_admin']
+                ['text' => $lang['delete_admin'], 'callback_data' => 'delete_admin:' . $pagination['page']],
             ];
         }
-        $keyboard['inline_keyboard'][] = [
-            ['text' => $lang['back'], 'callback_data' => 'back_to_main']
-        ];
-
+        $keyboardRows[] = [['text' => $lang['back'], 'callback_data' => 'back_to_main']];
         handleUserState('clear', $chatId);
-
         sendRequest('editMessageText', [
             'chat_id' => $chatId,
             'message_id' => $messageId,
-            'text' => $lang['select_admin_prompt'],
+            'text' => $total > 0 ? $lang['select_admin_prompt'] : $lang['no_admins'],
             'parse_mode' => 'Markdown',
-            'reply_markup' => json_encode($keyboard)
-        ]);
-        return;
-    }        
-    if ($data === 'delete_admin') {
-        $adminsResult = $marzbanConn->query("SELECT id, username FROM admins");
-        $admins = [];
-        while ($row = $adminsResult->fetch_assoc()) {
-            $admins[] = ['text' => $row['username'], 'callback_data' => 'confirm_delete_admin:' . $row['id']];
-        }
-    
-        $keyboard = ['inline_keyboard' => array_chunk($admins, 2)];
-        $keyboard['inline_keyboard'][] = [
-            ['text' => $lang['back'], 'callback_data' => 'manage_admins']
-        ];
-    
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'text' => $lang['select_admin_to_delete'],
-            'reply_markup' => $keyboard
+            'reply_markup' => json_encode(['inline_keyboard' => $keyboardRows]),
         ]);
         return;
     }
-    
+    if (strpos($data, 'set_max_duration:') === 0) {
+        $adminId = intval(substr($data, strlen('set_max_duration:')));
+        $keyboard = [
+            [
+                ['text' => '7', 'callback_data' => "set_max_duration_value:$adminId:7"],
+                ['text' => '31', 'callback_data' => "set_max_duration_value:$adminId:31"],
+                ['text' => '90', 'callback_data' => "set_max_duration_value:$adminId:90"]
+            ],
+            [
+                ['text' => $lang['set_custom_limit'], 'callback_data' => "custom_set_max_duration:$adminId"],
+                ['text' => $lang['unlimited'], 'callback_data' => "set_max_duration_value:$adminId:0"]
+            ],
+            [
+                ['text' => $lang['back'], 'callback_data' => 'select_admin:' . $adminId]
+            ]
+        ];
+        sendRequest('editMessageText', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $lang['max_duration_prompt'],
+            'reply_markup' => json_encode(['inline_keyboard' => $keyboard])
+        ]);
+        return;
+    }
+    if (strpos($data, 'set_max_duration_value:') === 0) {
+        [, $adminId, $durationDays] = explode(':', $data);
+        $adminId = intval($adminId);
+        $durationDays = intval($durationDays);
+        $stmt = $botConn->prepare(
+            "INSERT INTO marzhelp_admin_settings (admin_id, max_user_duration_days) VALUES (?, NULLIF(?, 0)) " .
+            "ON DUPLICATE KEY UPDATE max_user_duration_days = NULLIF(VALUES(max_user_duration_days), 0)"
+        );
+        $stmt->bind_param('ii', $adminId, $durationDays);
+        $stmt->execute();
+        $stmt->close();
+        sendRequest('editMessageText', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $lang['max_duration_saved'],
+            'reply_markup' => getBackToAdminManagementKeyboard($adminId, $userId)
+        ]);
+        return;
+    }
+    if (strpos($data, 'custom_set_max_duration:') === 0) {
+        $adminId = intval(substr($data, strlen('custom_set_max_duration:')));
+        handleUserState('set', $userId, 'set_max_duration', $adminId);
+        sendRequest('editMessageText', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $lang['max_duration_custom_prompt'],
+            'reply_markup' => getBackToAdminManagementKeyboard($adminId, $userId)
+        ]);
+        return;
+    }
+
+    if ($data === 'delete_admin' || strpos($data, 'delete_admin:') === 0) {
+        $requestedPage = strpos($data, 'delete_admin:') === 0
+            ? (int)substr($data, strlen('delete_admin:'))
+            : (int)(handleTemporaryData('get', $userId, 'admin_list_page') ?: 1);
+        $countResult = $marzbanConn->query('SELECT COUNT(*) AS total FROM admins WHERE is_sudo = 0');
+        $total = (int)$countResult->fetch_assoc()['total'];
+        $pagination = marzhelpNormalizeAdminPage($requestedPage, $total);
+        $statement = $marzbanConn->prepare(
+            'SELECT id, username FROM admins WHERE is_sudo = 0 ORDER BY username ASC, id ASC LIMIT ? OFFSET ?'
+        );
+        $statement->bind_param('ii', $pagination['limit'], $pagination['offset']);
+        $statement->execute();
+        $result = $statement->get_result();
+        $admins = [];
+        while ($row = $result->fetch_assoc()) {
+            $admins[] = [
+                'text' => $row['username'],
+                'callback_data' => 'confirm_delete_admin:' . $row['id'] . ':' . $pagination['page'],
+            ];
+        }
+        $statement->close();
+        $keyboard = ['inline_keyboard' => array_chunk($admins, 2)];
+        if ($total > 0) {
+            $keyboard['inline_keyboard'][] = marzhelpAdminPaginationRow(
+                $pagination['page'], $pagination['pages'], $lang
+            );
+        }
+        $keyboard['inline_keyboard'][] = [[
+            'text' => $lang['back'], 'callback_data' => 'manage_admins:' . $pagination['page'],
+        ]];
+        sendRequest('editMessageText', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $total > 0 ? $lang['select_admin_to_delete'] : $lang['no_admins'],
+            'reply_markup' => $keyboard,
+        ]);
+        return;
+    }
+
     if (strpos($data, 'confirm_delete_admin:') === 0) {
-        $adminId = intval(substr($data, strlen('confirm_delete_admin:')));
+        $deleteParts = explode(':', $data);
+        $adminId = (int)($deleteParts[1] ?? 0);
+        $deletePage = max(1, (int)($deleteParts[2] ?? 1));
     
         $stmt = $marzbanConn->prepare("SELECT username FROM admins WHERE id = ?");
         $stmt->bind_param("i", $adminId);
@@ -1477,8 +1321,8 @@ function handleCallbackQuery($callback_query) {
         $keyboard = [
             'inline_keyboard' => [
                 [
-                    ['text' => $lang['confirm_yes_button'], 'callback_data' => 'delete_admin_confirmed:' . $adminId],
-                    ['text' => $lang['confirm_no_button'], 'callback_data' => 'delete_admin_cancel']
+                    ['text' => $lang['confirm_yes_button'], 'callback_data' => 'delete_admin_confirmed:' . $adminId . ':' . $deletePage],
+                    ['text' => $lang['confirm_no_button'], 'callback_data' => 'delete_admin:' . $deletePage]
                 ]
             ]
         ];
@@ -1493,7 +1337,9 @@ function handleCallbackQuery($callback_query) {
     }
     
     if (strpos($data, 'delete_admin_confirmed:') === 0) {
-        $adminId = intval(substr($data, strlen('delete_admin_confirmed:')));
+        $deleteParts = explode(':', $data);
+        $adminId = (int)($deleteParts[1] ?? 0);
+        $deletePage = max(1, (int)($deleteParts[2] ?? 1));
     
         $stmt = $marzbanConn->prepare("SELECT username, is_sudo FROM admins WHERE id = ?");
         $stmt->bind_param("i", $adminId);
@@ -1546,9 +1392,12 @@ function handleCallbackQuery($callback_query) {
         
         sendRequest('sendMessage', [
             'chat_id' => $chatId,
-            #'message_id' => $messageId,
             'text' => $lang['main_menu'],
-            'reply_markup' => getMainMenuKeyboard($userId)
+            'reply_markup' => [
+                'inline_keyboard' => [[
+                    ['text' => $lang['manage_admins'], 'callback_data' => 'manage_admins:' . $deletePage]
+                ]]
+            ]
         ]);
         return;
     }
@@ -1573,79 +1422,6 @@ function handleCallbackQuery($callback_query) {
         ]);
         return;
     }
-        if (strpos($data, 'toggle_prevent_user_deletion:') === 0) {
-        $adminId = intval(substr($data, strlen('toggle_prevent_user_deletion:')));
-    
-        $triggerName = 'admin_delete';
-    
-        $triggerExistsResult = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $adminIds = [];
-        if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-            $triggerResult = $marzbanConn->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                }
-            }
-        }
-    
-        if (in_array($adminId, $adminIds)) {
-            $adminIds = array_diff($adminIds, [$adminId]);
-        } else {
-            $adminIds[] = $adminId;
-        }
-    
-        if (empty($adminIds)) {
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        } else {
-            $adminIdsStr = implode(', ', $adminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE DELETE ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF OLD.admin_id IN ($adminIdsStr) THEN
-                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Deletion not allowed.';
-                END IF;
-            END
-            ";
-    
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-            $marzbanConn->query($triggerBody);
-        }
-    
-        $adminInfo = getAdminInfo($adminId, $userId);
-        if (!$adminInfo) {
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['callbackResponse_adminNotFound']
-            ]);
-            return;
-        }
-        $adminInfo['adminId'] = $adminId;
-        $infoText = getAdminInfoText($adminInfo, $userId);
-    
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'text' => $lang['callbackResponse_showRestrictions'],
-            'parse_mode' => 'Markdown',
-            'reply_markup' => getRestrictionsKeyboard(
-                $adminId, 
-                $adminInfo['preventUserDeletion'], 
-                $adminInfo['preventUserCreation'], 
-                $adminInfo['preventUserReset'], 
-                $adminInfo['preventRevokeSubscription'], 
-                $adminInfo['preventUnlimitedTraffic'],
-                $userId
-            )
-                    ]);
-    
-        return;
-    } 
     if ($data === 'back_to_main') {
         sendRequest('editMessageText', [
             'chat_id' => $chatId,
@@ -2028,7 +1804,11 @@ function handleCallbackQuery($callback_query) {
         return;
     }
     if (strpos($data, 'select_admin:') === 0) {
-        $adminId = intval(substr($data, strlen('select_admin:')));
+        $selectParts = explode(':', $data);
+        $adminId = (int)($selectParts[1] ?? 0);
+        if (isset($selectParts[2])) {
+            handleTemporaryData('set', $userId, 'admin_list_page', (string)max(1, (int)$selectParts[2]));
+        }
 
         $adminInfo = getAdminInfo($adminId, $userId);
         if (!$adminInfo) {
@@ -2140,80 +1920,6 @@ function handleCallbackQuery($callback_query) {
             return;
         }
     }
-    if (strpos($data, 'toggle_prevent_user_reset:') === 0) {
-        $adminId = intval(substr($data, strlen('toggle_prevent_user_reset:')));
-    
-        $triggerName = 'prevent_User_Reset_Usage';
-    
-        $triggerExistsResult = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = '$triggerName'");
-        $adminIds = [];
-        if ($triggerExistsResult && $triggerExistsResult->num_rows > 0) {
-            $triggerResult = $marzbanConn->query("SHOW CREATE TRIGGER `$triggerName`");
-            if ($triggerResult && $triggerResult->num_rows > 0) {
-                $triggerRow = $triggerResult->fetch_assoc();
-                $triggerBody = $triggerRow['SQL Original Statement'];
-                if (preg_match("/IN\s*\((.*?)\)/", $triggerBody, $matches)) {
-                    $adminIdsStr = $matches[1];
-                    $adminIdsStr = str_replace(' ', '', $adminIdsStr);
-                    $adminIds = explode(',', $adminIdsStr);
-                }
-            }
-        }
-    
-        if (in_array($adminId, $adminIds)) {
-            $adminIds = array_diff($adminIds, [$adminId]);
-        } else {
-            $adminIds[] = $adminId;
-        }
-    
-        if (empty($adminIds)) {
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-        } else {
-            $adminIdsStr = implode(', ', $adminIds);
-            $triggerBody = "
-            CREATE TRIGGER `$triggerName` BEFORE UPDATE ON `users`
-            FOR EACH ROW
-            BEGIN
-                IF NEW.used_traffic <> OLD.used_traffic AND NEW.used_traffic = 0 THEN
-                    IF OLD.admin_id IN ($adminIdsStr) THEN
-                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Edit is not allowed.';
-                    END IF;    
-                END IF;
-            END;
-            ";
-    
-            $marzbanConn->query("DROP TRIGGER IF EXISTS `$triggerName`");
-            $marzbanConn->query($triggerBody);
-        }
-    
-        $adminInfo = getAdminInfo($adminId, $userId);
-        if (!$adminInfo) {
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['callbackResponse_adminNotFound']
-            ]);
-            return;
-        }
-        $adminInfo['adminId'] = $adminId;
-    
-        $infoText = getAdminInfoText($adminInfo, $userId);
-    
-        sendRequest('editMessageText', [
-            'chat_id' => $chatId,
-            'message_id' => $messageId,
-            'parse_mode' => 'Markdown',
-            'text' => $lang['callbackResponse_showRestrictions'],
-            'reply_markup' => getRestrictionsKeyboard(
-                $adminId, 
-                $adminInfo['preventUserDeletion'], 
-                $adminInfo['preventUserCreation'], 
-                $adminInfo['preventUserReset'], 
-                $adminInfo['preventRevokeSubscription'], 
-                $adminInfo['preventUnlimitedTraffic'],
-                $userId
-            )
-        ]);
-    }
     if (strpos($data, 'back_to_admin_management:') === 0) {
         $adminId = intval(substr($data, strlen('back_to_admin_management:')));
 
@@ -2277,7 +1983,7 @@ function handleCallbackQuery($callback_query) {
     if (strpos($data, 'set_traffic_unlimited:') === 0) {
         $adminId = intval(substr($data, strlen('set_traffic_unlimited:')));
     
-        $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, total_traffic) VALUES (?, NULL) ON DUPLICATE KEY UPDATE total_traffic = NULL");
+        $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, total_traffic) VALUES (?, NULL) ON DUPLICATE KEY UPDATE total_traffic = NULL");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $stmt->close();
@@ -2307,13 +2013,13 @@ function handleCallbackQuery($callback_query) {
     
         if ($action === 'add_traffic') {
             $stmt = $botConn->prepare("
-                INSERT INTO admin_settings (admin_id, total_traffic) 
+                INSERT INTO marzhelp_admin_settings (admin_id, total_traffic)
                 VALUES (?, ?) 
                 ON DUPLICATE KEY UPDATE total_traffic = COALESCE(total_traffic, 0) + VALUES(total_traffic)
             ");
         } else {
             $stmt = $botConn->prepare("
-                INSERT INTO admin_settings (admin_id, total_traffic) 
+                INSERT INTO marzhelp_admin_settings (admin_id, total_traffic)
                 VALUES (?, -?) 
                 ON DUPLICATE KEY UPDATE total_traffic = COALESCE(total_traffic, 0) + VALUES(total_traffic)
             ");
@@ -2393,7 +2099,7 @@ function handleCallbackQuery($callback_query) {
     if (strpos($data, 'set_expiry_unlimited:') === 0) {
         $adminId = intval(substr($data, strlen('set_expiry_unlimited:')));
 
-        $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, expiry_date) VALUES (?, NULL) ON DUPLICATE KEY UPDATE expiry_date = NULL");
+        $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, expiry_date) VALUES (?, NULL) ON DUPLICATE KEY UPDATE expiry_date = NULL");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $stmt->close();
@@ -2423,7 +2129,7 @@ function handleCallbackQuery($callback_query) {
 
         $expiryDate = date('Y-m-d', strtotime("+$days days"));
 
-        $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, expiry_date) VALUES (?, ?) ON DUPLICATE KEY UPDATE expiry_date = ?");
+        $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, expiry_date) VALUES (?, ?) ON DUPLICATE KEY UPDATE expiry_date = ?");
         $stmt->bind_param("iss", $adminId, $expiryDate, $expiryDate);
         $stmt->execute();
         $stmt->close();
@@ -2489,7 +2195,7 @@ function handleCallbackQuery($callback_query) {
         try {
             $marzbanapi->disableAllActiveUsers($adminUsername);
     
-            $stmt = $botConn->prepare("SELECT status FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT status FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -2499,7 +2205,7 @@ function handleCallbackQuery($callback_query) {
             $currentStatus['users'] = 'disabled';
             $newStatus = json_encode($currentStatus);
     
-            $stmt = $botConn->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -2547,7 +2253,7 @@ function handleCallbackQuery($callback_query) {
         try {
             $marzbanapi->activateAllDisabledUsers($adminUsername);
     
-            $stmt = $botConn->prepare("SELECT status FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT status FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -2557,7 +2263,7 @@ function handleCallbackQuery($callback_query) {
             $currentStatus['users'] = 'active';
             $newStatus = json_encode($currentStatus);
     
-            $stmt = $botConn->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -2863,7 +2569,12 @@ function handleCallbackQuery($callback_query) {
             if ($currentType == 'exclude') {
                 $marzbanConn->query("UPDATE marzhelp_limits SET type = 'dedicated' WHERE admin_id = $adminId AND inbound_tag = '$inboundTag'");
             } else {
-                $marzbanConn->query("DELETE FROM marzhelp_limits WHERE admin_id = $adminId AND inbound_tag = '$inboundTag'");
+                $deleteLimit = $marzbanConn->prepare(
+                    'DELETE FROM marzhelp_limits WHERE admin_id = ? AND inbound_tag = ?'
+                );
+                $deleteLimit->bind_param('is', $adminId, $inboundTag);
+                $deleteLimit->execute();
+                $deleteLimit->close();
             }
         } else {
             $marzbanConn->query("INSERT INTO marzhelp_limits (type, admin_id, inbound_tag) VALUES ('exclude', $adminId, '$inboundTag')");
@@ -3357,7 +3068,7 @@ function handleCallbackQuery($callback_query) {
     if (strpos($data, 'set_lang_') === 0) {
             $selectedLang = substr($data, 9); 
             
-            $stmt = $botConn->prepare("UPDATE user_states SET lang = ? WHERE user_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_user_states SET lang = ? WHERE user_id = ?");
             $stmt->bind_param("si", $selectedLang, $userId);
             $stmt->execute();
         
@@ -3385,7 +3096,7 @@ function handleCallbackQuery($callback_query) {
             $adminInfo = getAdminInfo($userId); 
             $lang = getLang($userId); 
         
-            $stmt = $botConn->prepare("SELECT username, updated_at, lang, message_id FROM user_states WHERE user_id = ?");
+            $stmt = $botConn->prepare("SELECT username, updated_at, lang, message_id FROM marzhelp_user_states WHERE user_id = ?");
             $stmt->bind_param("i", $userId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -3428,7 +3139,7 @@ function handleCallbackQuery($callback_query) {
         }
         if ($data === 'change_language') {
             
-            $stmt = $botConn->prepare("SELECT username, updated_at, lang, message_id FROM user_states WHERE user_id = ?");
+            $stmt = $botConn->prepare("SELECT username, updated_at, lang, message_id FROM marzhelp_user_states WHERE user_id = ?");
             $stmt->bind_param("i", $userId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -3509,91 +3220,6 @@ function handleCallbackQuery($callback_query) {
                 ]);
             }
         
-            return;
-        }
-        if ($data === 'save_admin_traffic') {
-            $triggerExists1 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_used'")->num_rows > 0;
-            $triggerExists2 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_reseted'")->num_rows > 0;
-        
-            $buttonText = ($triggerExists1 && $triggerExists2) ? $lang['deactivate'] : $lang['activate'];
-        
-            $keyboard = [
-                'inline_keyboard' => [
-                    [
-                        ['text' => $buttonText, 'callback_data' => 'toggle_traffic_triggers']
-                    ],
-                    [
-                        ['text' => $lang['back'], 'callback_data' => 'settings']
-                    ]
-                ]
-            ];
-        
-            sendRequest('editMessageText', [
-                'chat_id' => $chatId,
-                'message_id' => $messageId,
-                'text' => $lang['traffic_settings'],
-                'reply_markup' => json_encode($keyboard)
-            ]);
-            return;
-        }
-        
-        if ($data === 'toggle_traffic_triggers') {
-            $triggerExists1 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_used'")->num_rows > 0;
-            $triggerExists2 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_reseted'")->num_rows > 0;
-        
-            if (!$triggerExists1 && !$triggerExists2) {
-                $createTrigger1 = "CREATE TRIGGER `save_user_traffic_used` BEFORE DELETE ON `users` FOR EACH ROW BEGIN INSERT INTO user_deletions (user_id, used_traffic, admin_id) VALUES (OLD.id, OLD.used_traffic, OLD.admin_id); END";
-                $createTrigger2 = "CREATE TRIGGER `save_user_traffic_reseted` BEFORE UPDATE ON `user_usage_logs` FOR EACH ROW BEGIN DECLARE admin_id INT; IF OLD.user_id IS NOT NULL AND NEW.user_id IS NULL THEN SELECT u.admin_id INTO admin_id FROM users u WHERE u.id = OLD.user_id; INSERT INTO user_deletions (user_id, reseted_usage, admin_id) VALUES (OLD.user_id, OLD.used_traffic_at_reset, admin_id); END IF; END";
-        
-                if ($marzbanConn->query($createTrigger1) && $marzbanConn->query($createTrigger2)) {
-                    sendRequest('editMessageText', [
-                        'chat_id' => $chatId,
-                        'message_id' => $messageId,
-                        'text' => $lang['triggers_activated']
-                    ]);
-                } else {
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['error_creating_triggers']
-                    ]);
-                }
-            } else {
-                $dropTrigger1 = "DROP TRIGGER IF EXISTS `save_user_traffic_used`";
-                $dropTrigger2 = "DROP TRIGGER IF EXISTS `save_user_traffic_reseted`";
-        
-                if ($marzbanConn->query($dropTrigger1) && $marzbanConn->query($dropTrigger2)) {
-                    sendRequest('editMessageText', [
-                        'chat_id' => $chatId,
-                        'message_id' => $messageId,
-                        'text' => $lang['triggers_deactivated']
-                    ]);
-                } else {
-                    sendRequest('sendMessage', [
-                        'chat_id' => $chatId,
-                        'text' => $lang['error_dropping_triggers']
-                    ]);
-                }
-            }
-        
-            $triggerExists1 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_used'")->num_rows > 0;
-            $triggerExists2 = $marzbanConn->query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = 'save_user_traffic_reseted'")->num_rows > 0;
-        
-            $buttonText = ($triggerExists1 && $triggerExists2) ? $lang['deactivate'] : $lang['activate'];
-        
-            sendRequest('sendMessage', [
-                'chat_id' => $chatId,
-                'text' => $lang['traffic_settings'],
-                'reply_markup' => json_encode([
-                    'inline_keyboard' => [
-                        [
-                            ['text' => $buttonText, 'callback_data' => 'toggle_traffic_triggers']
-                        ],
-                        [
-                            ['text' => $lang['back'], 'callback_data' => 'settings']
-                        ]
-                    ]
-                ])
-            ]);
             return;
         }
         if ($data === 'backup') {
@@ -3777,7 +3403,7 @@ if (strpos($data, 'disable_users_') === 0) {
         try {
             $marzbanapi->disableAllActiveUsers($adminUsername);
 
-            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -3789,7 +3415,7 @@ if (strpos($data, 'disable_users_') === 0) {
             $currentStatus['users'] = 'disabled';
             $newStatus = json_encode($currentStatus);
 
-            $stmt = $botConn->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -3837,7 +3463,7 @@ if (strpos($data, 'enable_users_') === 0) {
         try {
             $marzbanapi->activateAllDisabledUsers($adminUsername);
 
-            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -3849,7 +3475,7 @@ if (strpos($data, 'enable_users_') === 0) {
             $currentStatus['users'] = 'active';
             $newStatus = json_encode($currentStatus);
 
-            $stmt = $botConn->prepare("UPDATE admin_settings SET status = ? WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET status = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $newStatus, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -3881,7 +3507,7 @@ if (strpos($data, 'enable_users_') === 0) {
 if (strpos($data, 'change_password_') === 0) {
     $adminId = str_replace('change_password_', '', $data);
     if (in_array($userId, $allowedUsers)) {
-        $stmt = $botConn->prepare("SELECT hashed_password_before, status FROM admin_settings WHERE admin_id = ?");
+        $stmt = $botConn->prepare("SELECT hashed_password_before, status FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -3903,7 +3529,7 @@ if (strpos($data, 'change_password_') === 0) {
             $stmt->fetch();
             $stmt->close();
 
-            $stmt = $botConn->prepare("UPDATE admin_settings SET hashed_password_before = ? WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET hashed_password_before = ? WHERE admin_id = ?");
             $stmt->bind_param("si", $currentPassword, $adminId);
             $stmt->execute();
             $stmt->close();
@@ -3941,7 +3567,7 @@ if (strpos($data, 'change_password_') === 0) {
 if (strpos($data, 'restore_password_') === 0) {
     $adminId = str_replace('restore_password_', '', $data);
     if (in_array($userId, $allowedUsers)) {
-        $stmt = $botConn->prepare("SELECT hashed_password_before, status FROM admin_settings WHERE admin_id = ?");
+        $stmt = $botConn->prepare("SELECT hashed_password_before, status FROM marzhelp_admin_settings WHERE admin_id = ?");
         $stmt->bind_param("i", $adminId);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -3958,7 +3584,7 @@ if (strpos($data, 'restore_password_') === 0) {
             $stmt->execute();
             $stmt->close();
 
-            $stmt = $botConn->prepare("UPDATE admin_settings SET hashed_password_before = NULL WHERE admin_id = ?");
+            $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET hashed_password_before = NULL WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $stmt->close();
@@ -4012,7 +3638,7 @@ if (strpos($data, 'set_calculate_volume:') === 0) {
 
     $adminId = (int)$adminId;
 
-    $stmt = $botConn->prepare("UPDATE admin_settings SET calculate_volume = ? WHERE admin_id = ?");
+    $stmt = $botConn->prepare("UPDATE marzhelp_admin_settings SET calculate_volume = ? WHERE admin_id = ?");
     $stmt->bind_param("si", $type, $adminId);
     $stmt->execute();
     $stmt->close();
@@ -4200,8 +3826,8 @@ if ($data === 'marzban_update') {
                     $promptMessageId = $userState['message_id'];
                     $dataLimitBytes = $dataLimit * 1073741824;
     
-                    $sql = "UPDATE users SET data_limit = data_limit + $dataLimitBytes WHERE data_limit IS NOT NULL AND admin_id in ($adminId)";
-                    if ($marzbanConn->query($sql) === TRUE) {
+                    $bulkResult = modifyAdminUsersViaApi($adminId, 'data_limit', (int)$dataLimitBytes);
+                    if ($bulkResult['failed'] === 0) {
 
                         sendRequest('deleteMessage', [
                             'chat_id' => $chatId,
@@ -4225,7 +3851,11 @@ if ($data === 'marzban_update') {
                     ]);
     
                 handleUserState('clear', $userId);
-
+                } else {
+                    sendRequest('sendMessage', [
+                        'chat_id' => $chatId,
+                        'text' => $lang['operation_failed'] . implode("\n", $bulkResult['errors'])
+                    ]);
                 }
                     return;
                 } else {
@@ -4244,12 +3874,8 @@ if ($data === 'marzban_update') {
                     $adminId = $userState['admin_id'];
 
     
-                    $sql = "UPDATE users 
-                            SET data_limit = GREATEST(0, data_limit - (1073741824 * $dataLimit)) 
-                            WHERE data_limit IS NOT NULL 
-                            AND admin_id IN ($adminId)";
-
-                    if ($marzbanConn->query($sql) === TRUE) {
+                    $bulkResult = modifyAdminUsersViaApi($adminId, 'data_limit', -(int)$dataLimitBytes);
+                    if ($bulkResult['failed'] === 0) {
                     $adminId = $userState['admin_id'];
                     $promptMessageId = $userState['message_id'];
 
@@ -4274,7 +3900,12 @@ if ($data === 'marzban_update') {
                     ]);
     
                     handleUserState('clear', $userId);
-          }
+                    } else {
+                        sendRequest('sendMessage', [
+                            'chat_id' => $chatId,
+                            'text' => $lang['operation_failed'] . implode("\n", $bulkResult['errors'])
+                        ]);
+                    }
             return;
                 } else {
                     sendRequest('sendMessage', [
@@ -4290,7 +3921,7 @@ if ($data === 'marzban_update') {
                     $adminId = $userState['admin_id'];
                     $promptMessageId = $userState['message_id'];
 
-                    $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, user_limit) VALUES (?, ?) ON DUPLICATE KEY UPDATE user_limit = ?");
+                    $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, user_limit) VALUES (?, ?) ON DUPLICATE KEY UPDATE user_limit = ?");
                     $stmt->bind_param("iii", $adminId, $userLimit, $userLimit);
                     $stmt->execute();
                     $stmt->close();
@@ -4331,8 +3962,8 @@ if ($data === 'marzban_update') {
                     $secondsToAdd = 86400 * $days;
                     $promptMessageId = $userState['message_id'];
 
-                    $sql = "UPDATE users SET expire = expire + ($secondsToAdd) WHERE expire IS NOT NULL AND admin_id IN ($adminId)";
-                    if ($marzbanConn->query($sql) === TRUE) {
+                    $bulkResult = modifyAdminUsersViaApi($adminId, 'expire', $secondsToAdd);
+                    if ($bulkResult['failed'] === 0) {
 
                         sendRequest('deleteMessage', [
                             'chat_id' => $chatId,
@@ -4346,7 +3977,7 @@ if ($data === 'marzban_update') {
                     } else {
                         sendRequest('sendMessage', [
                             'chat_id' => $chatId,
-                            'text' => $lang['operation_failed'] . $marzbanConn->error
+                            'text' => $lang['operation_failed'] . implode("\n", $bulkResult['errors'])
                         ]);
                     }
     
@@ -4372,6 +4003,31 @@ if ($data === 'marzban_update') {
                     return;
                 }
             }
+            if ($userState['state'] === 'set_max_duration') {
+                $durationDays = intval($text);
+                if ($durationDays > 0) {
+                    $adminId = (int)$userState['admin_id'];
+                    $stmt = $botConn->prepare(
+                        "INSERT INTO marzhelp_admin_settings (admin_id, max_user_duration_days) VALUES (?, ?) " .
+                        "ON DUPLICATE KEY UPDATE max_user_duration_days = VALUES(max_user_duration_days)"
+                    );
+                    $stmt->bind_param('ii', $adminId, $durationDays);
+                    $stmt->execute();
+                    $stmt->close();
+                    handleUserState('clear', $userId);
+                    sendRequest('sendMessage', [
+                        'chat_id' => $chatId,
+                        'text' => $lang['max_duration_saved'],
+                        'reply_markup' => getBackToAdminManagementKeyboard($adminId, $userId)
+                    ]);
+                } else {
+                    sendRequest('sendMessage', [
+                        'chat_id' => $chatId,
+                        'text' => $lang['invalid_input']
+                    ]);
+                }
+                return;
+            }
             if ($userState['state'] === 'reduce_time') {
                 $days = intval($text);
                 if ($days > 0) {
@@ -4379,8 +4035,8 @@ if ($data === 'marzban_update') {
                     $secondsToReduce = 86400 * $days;
                     $promptMessageId = $userState['message_id'];
     
-                    $sql = "UPDATE users SET expire = expire - ($secondsToReduce) WHERE expire IS NOT NULL AND admin_id IN ($adminId)";
-                    if ($marzbanConn->query($sql) === TRUE) {
+                    $bulkResult = modifyAdminUsersViaApi($adminId, 'expire', -$secondsToReduce);
+                    if ($bulkResult['failed'] === 0) {
 
                         sendRequest('deleteMessage', [
                             'chat_id' => $chatId,
@@ -4398,7 +4054,7 @@ if ($data === 'marzban_update') {
                     } else {
                         sendRequest('sendMessage', [
                             'chat_id' => $chatId,
-                            'text' => $lang['operation_failed'] . $marzbanConn->error
+                            'text' => $lang['operation_failed'] . implode("\n", $bulkResult['errors'])
                         ]);
                     }
     
@@ -4433,13 +4089,13 @@ if ($data === 'marzban_update') {
             
                     if ($userState['state'] === 'custom_add') {
                         $stmt = $botConn->prepare("
-                            INSERT INTO admin_settings (admin_id, total_traffic) 
+                            INSERT INTO marzhelp_admin_settings (admin_id, total_traffic)
                             VALUES (?, ?) 
                             ON DUPLICATE KEY UPDATE total_traffic = COALESCE(total_traffic, 0) + VALUES(total_traffic)
                         ");
                     } else {
                         $stmt = $botConn->prepare("
-                            INSERT INTO admin_settings (admin_id, total_traffic) 
+                            INSERT INTO marzhelp_admin_settings (admin_id, total_traffic)
                             VALUES (?, -?) 
                             ON DUPLICATE KEY UPDATE total_traffic = COALESCE(total_traffic, 0) + VALUES(total_traffic)
                         ");
@@ -4489,7 +4145,7 @@ if ($data === 'marzban_update') {
                     $expiryDate = date('Y-m-d', strtotime("+$days days"));
                     $promptMessageId = $userState['message_id'];
 
-                    $stmt = $botConn->prepare("INSERT INTO admin_settings (admin_id, expiry_date) VALUES (?, ?) ON DUPLICATE KEY UPDATE expiry_date = ?");
+                    $stmt = $botConn->prepare("INSERT INTO marzhelp_admin_settings (admin_id, expiry_date) VALUES (?, ?) ON DUPLICATE KEY UPDATE expiry_date = ?");
                     $stmt->bind_param("iss", $adminId, $expiryDate, $expiryDate);
                     $stmt->execute();
                     $stmt->close();
@@ -4813,7 +4469,7 @@ if ($data === 'marzban_update') {
             return;
         }*/
         if ($text === '/start') {
-            $stmt = $botConn->prepare("SELECT lang FROM user_states WHERE user_id = ?");
+            $stmt = $botConn->prepare("SELECT lang FROM marzhelp_user_states WHERE user_id = ?");
             $stmt->bind_param("i", $userId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -4823,7 +4479,7 @@ if ($data === 'marzban_update') {
                 $row = $result->fetch_assoc();
                 $lang = $row['lang'];
             } else {
-                $stmt = $botConn->prepare("INSERT INTO user_states (user_id, lang, state) VALUES (?, NULL, NULL)");
+                $stmt = $botConn->prepare("INSERT INTO marzhelp_user_states (user_id, lang, state) VALUES (?, NULL, NULL)");
                 $stmt->bind_param("i", $userId);
                 $stmt->execute();
             }

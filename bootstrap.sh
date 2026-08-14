@@ -15,11 +15,11 @@ if [[ -z "$requested_ref" ]]; then
             ;;
         -h|--help)
             printf 'Usage: bootstrap.sh [--version] <tag-or-branch>\n'
-            printf 'Default version: main\n'
+            printf 'Default version: v2\n'
             exit 0
             ;;
         '')
-            requested_ref="main"
+            requested_ref="v2"
             ;;
         *)
             requested_ref="$1"

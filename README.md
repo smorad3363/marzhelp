@@ -15,21 +15,23 @@
 - وبهوک تلگرام با یک مقدار محرمانه ثبت می‌شود.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/main/bootstrap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/refs/tags/v2/bootstrap.sh)
 ```
 
-دستور بالا آخرین نسخه شاخه `main` را نصب می‌کند.
+این دستور نسخه ثابت `v2` را نصب می‌کند و فقط با `smorad3363/Marzban v4`
+و schema سازگار شماره `1` ادامه می‌دهد. داده‌های MarzHelp در همان دیتابیس
+Marzban نگهداری می‌شوند و backup عادی Marzban آن‌ها را نیز پوشش می‌دهد.
 
 برای نصب یا بازگشت به یک نسخه مشخص، تگ را به اسکریپت بدهید:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/main/bootstrap.sh) --version v1.1
+bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/refs/tags/v2/bootstrap.sh) --version v2
 ```
 
 شکل کوتاه زیر نیز همان نتیجه را دارد:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/main/bootstrap.sh) v1.1
+bash <(curl -fsSL https://raw.githubusercontent.com/smorad3363/marzhelp/refs/tags/v2/bootstrap.sh) v2
 ```
 
 ورودی نسخه می‌تواند نام یک تگ یا شاخه معتبر باشد. اگر نصب قبلی وجود داشته

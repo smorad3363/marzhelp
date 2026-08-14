@@ -72,6 +72,9 @@ function getAdminManagementKeyboard($adminId, $status, $userId) {
             ],
             [
                 ['text' => $lang['setuserlimitbutton'], 'callback_data' => 'set_user_limit:' . $adminId],
+                ['text' => $lang['max_duration_button'], 'callback_data' => 'set_max_duration:' . $adminId]
+            ],
+            [
                 ['text' => $lang['securityButton'], 'callback_data' => 'security:' . $adminId]
             ],
             [
@@ -322,7 +325,7 @@ function getAdminExpireKeyboard($adminId, $userId) {
         
             $lang = getLang($userId); 
         
-            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT status, hashed_password_before FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();
@@ -349,7 +352,7 @@ function getCalculateVolumeKeyboard($adminId, $userId) {
             global $botConn;
             $lang = getLang($userId);
         
-            $stmt = $botConn->prepare("SELECT calculate_volume FROM admin_settings WHERE admin_id = ?");
+            $stmt = $botConn->prepare("SELECT calculate_volume FROM marzhelp_admin_settings WHERE admin_id = ?");
             $stmt->bind_param("i", $adminId);
             $stmt->execute();
             $result = $stmt->get_result();

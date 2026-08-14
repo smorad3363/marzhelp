@@ -208,6 +208,11 @@ return [
     'traffic_exhausted_notify' => 'Traffic for panel %s (ID: %d) has been exhausted.',
     'traffic_restored_notify' => 'Traffic for panel %s (ID: %d) has been restored.',
     'set_custom_limit' => 'Custom limit',
+    'max_duration_button' => '📅 Maximum user duration',
+    'max_duration_label' => 'Maximum user duration',
+    'max_duration_prompt' => 'Select the maximum remaining validity in days:',
+    'max_duration_custom_prompt' => 'Send the maximum remaining validity in days:',
+    'max_duration_saved' => 'Maximum user duration was saved.',
     'display_only_button' => 'If set to "Exclusive," the selected inbound will be assigned to the specified admin.
     If set to "Disabled," your admin will not be able to use the selected inbounds.',
     'exclude_type' => 'Exclude Inbound',

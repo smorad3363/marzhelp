@@ -59,10 +59,10 @@ PATH="${mock_bin}:${PATH}" \
 TEST_RESULT_FILE="$result_file" \
 TEST_CURL_LOG="$curl_log" \
 MARZHELP_DIRECTORY="$installation" \
-bash "${PROJECT_ROOT}/bootstrap.sh" --version v1.1
+bash "${PROJECT_ROOT}/bootstrap.sh" --version v2
 
-grep -q '/v1.1/install.sh$' "$curl_log"
-grep -q '^v1.1|--full$' "$result_file"
+grep -q '/v2/install.sh$' "$curl_log"
+grep -q '^v2|--full$' "$result_file"
 
 : > "${installation}/config.php"
 

@@ -3,7 +3,7 @@
 set -e
 
 readonly MARZHELP_REPOSITORY="${MARZHELP_REPOSITORY:-https://github.com/smorad3363/marzhelp.git}"
-readonly MARZHELP_REF="${MARZHELP_REF:-${MARZHELP_BRANCH:-main}}"
+readonly MARZHELP_REF="${MARZHELP_REF:-${MARZHELP_BRANCH:-v2}}"
 readonly MARZHELP_RAW_BASE="${MARZHELP_RAW_BASE:-https://raw.githubusercontent.com/smorad3363/marzhelp/${MARZHELP_REF}}"
 readonly MARZHELP_DIRECTORY="${MARZHELP_DIRECTORY:-/var/www/html/marzhelp}"
 
@@ -31,10 +31,60 @@ display_message() {
     echo -e "\033[${color}m${message}\033[0m"
 }
 
+verify_compatible_marzban() {
+    local root_password="${MARZBAN_ROOT_PASSWORD:-}"
+    local query="SELECT CONCAT(COALESCE(MAX(CASE WHEN \`key\`='source_id' THEN \`value\` END), ''), '|', COALESCE(MAX(CASE WHEN \`key\`='schema_version' THEN \`value\` END), ''), '|', (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='marzban' AND table_name IN ('marzhelp_metadata','marzhelp_admin_settings','marzhelp_user_states','marzhelp_user_temporaries','marzhelp_admin_usage','marzhelp_limits','marzhelp_runtime_settings','marzhelp_deleted_users','marzhelp_accounting_transactions'))) FROM marzhelp_metadata;"
+    local compatibility
+    if command -v mysql >/dev/null 2>&1; then
+        compatibility=$(mysql -N -B -h 127.0.0.1 -u root -p"$root_password" marzban -e "$query" 2>/dev/null) || compatibility=""
+    elif command -v docker >/dev/null 2>&1 && [ -f /opt/marzban/docker-compose.yml ]; then
+        local mysql_container
+        mysql_container=$(docker compose -f /opt/marzban/docker-compose.yml ps -q mysql 2>/dev/null)
+        compatibility=$(docker exec "$mysql_container" mysql -N -B -u root -p"$root_password" marzban -e "$query" 2>/dev/null) || compatibility=""
+    else
+        compatibility=""
+    fi
+    if [ -z "$compatibility" ]; then
+        echo "Error: incompatible Marzban. Install smorad3363/Marzban v4 and run Alembic migrations first."
+        exit 1
+    fi
+    if [ "$compatibility" != "smorad3363-marzban|1|9" ]; then
+        echo "Error: incompatible Marzban marker '$compatibility'. Required: smorad3363/Marzban v4, schema 1 with 9 canonical tables."
+        exit 1
+    fi
+}
+
+load_marzban_root_password() {
+    local env_file="/opt/marzban/.env"
+    local legacy_config="/root/marzhelp.txt"
+    local password=""
+
+    if [ -f "$env_file" ]; then
+        password=$(read_env_variable "MYSQL_ROOT_PASSWORD" "$env_file")
+    fi
+    if [ -z "$password" ] && [ -f "$legacy_config" ]; then
+        password=$(grep '^MYSQL_ROOT_PASSWORD=' "$legacy_config" | head -n1 | cut -d'=' -f2-)
+    fi
+    while [ -z "$password" ]; do
+        read -r -s -p "Enter the Marzban MySQL root password: " password
+        echo
+        if [ -z "$password" ]; then
+            echo "Error: MySQL root password cannot be empty."
+        fi
+    done
+    MARZBAN_ROOT_PASSWORD="$password"
+}
+
+install_cron_job() {
+    local cron_job="* * * * * php ${MARZHELP_DIRECTORY}/crons/cron.php >/dev/null 2>&1"
+    ({ crontab -l 2>/dev/null | grep -Fv "${MARZHELP_DIRECTORY}/crons/cron.php" || true; };
+        echo "$cron_job") | crontab -
+}
+
 # Function to retrieve or prompt for the MySQL root password
 get_mysql_root_password() {
     local env_file="/opt/marzban/.env"
-    local password=""
+    local password="${MARZBAN_ROOT_PASSWORD:-}"
     local config_file="/root/marzhelp.txt"
  
 
@@ -605,21 +655,15 @@ install_marzhelp() {
     migrationDbPassword="$(openssl rand -hex 24)"
     webhookSecret="$(openssl rand -hex 32)"
 
+    verify_compatible_marzban
     mysql -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD" <<EOF
-CREATE DATABASE IF NOT EXISTS marzhelp
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
 CREATE USER IF NOT EXISTS '${appDbUser}'@'localhost' IDENTIFIED BY '${appDbPassword}';
 ALTER USER '${appDbUser}'@'localhost' IDENTIFIED BY '${appDbPassword}';
-GRANT SELECT, INSERT, UPDATE, DELETE ON marzhelp.* TO '${appDbUser}'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON ${vpnDbName}.* TO '${appDbUser}'@'localhost';
 
 CREATE USER IF NOT EXISTS '${migrationDbUser}'@'localhost' IDENTIFIED BY '${migrationDbPassword}';
 ALTER USER '${migrationDbUser}'@'localhost' IDENTIFIED BY '${migrationDbPassword}';
-GRANT ALL PRIVILEGES ON marzhelp.* TO '${migrationDbUser}'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, TRIGGER, EVENT, REFERENCES
-  ON ${vpnDbName}.* TO '${migrationDbUser}'@'localhost';
-SET GLOBAL event_scheduler = ON;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ${vpnDbName}.* TO '${migrationDbUser}'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
@@ -636,12 +680,7 @@ EOF
 
     install -d -o www-data -g www-data -m 750 /var/lib/marzhelp
     install -d -o root -g root -m 700 /var/backups/marzhelp
-    install -d -o root -g root -m 755 /etc/mysql/conf.d
-    cat > /etc/mysql/conf.d/marzhelp.cnf <<'EOF'
-[mysqld]
-event_scheduler=ON
-EOF
-    chmod 644 /etc/mysql/conf.d/marzhelp.cnf
+    rm -f /etc/mysql/conf.d/marzhelp.cnf
     rm -f /etc/sudoers.d/marzhelp
 
     chown -R root:www-data /var/www/html/marzhelp
@@ -666,7 +705,7 @@ EOF
 \$botDbHost = 'localhost';
 \$botDbUser = '$appDbUser';
 \$botDbPass = '$appDbPassword';
-\$botDbName = 'marzhelp';
+\$botDbName = '$vpnDbName';
 
 \$vpnDbHost = 'localhost';
 \$vpnDbUser = '$appDbUser';
@@ -684,13 +723,14 @@ EOL
     chown root:www-data /var/www/html/marzhelp/config.php
     chmod 640 /var/www/html/marzhelp/config.php
 
-    # Execute table.php if it exists
+    # Verify the Marzban-owned schema. This script never creates tables.
     if [ -f "/var/www/html/marzhelp/table.php" ]; then
         php /var/www/html/marzhelp/table.php
-        echo "table.php executed successfully."
+        echo "Marzban-owned schema verified successfully."
     else
         echo "table.php not found."
     fi
+    install_cron_job
 
     ufw allow 88/tcp
 
@@ -799,7 +839,7 @@ main() {
             7) remove_nginx ;;
             8) echo "Nginx is managed through /etc/nginx/sites-available/marzhelp." ;;
             9) ufw status verbose ;;
-            10) install_nginx; install_php_packages; configure_nginx_ssl; install_marzhelp ;;
+            10) verify_compatible_marzban; install_nginx; install_php_packages; configure_nginx_ssl; install_marzhelp ;;
             11) uninstall_marzhelp ;;   # New case for uninstalling Marzhelp
             0) echo "Exiting..."; exit 0 ;;
             *) echo "Invalid option. Please try again." ;;
@@ -807,19 +847,27 @@ main() {
     done
 }
 
+if [ "${MARZHELP_LIB_ONLY:-0}" = "1" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 ensure_root
+load_marzban_root_password
+verify_compatible_marzban
 check_marzhelp_config
 cat_config_with_color
 get_mysql_root_password
 
 case "${1:-}" in
     --full)
+        verify_compatible_marzban
         install_nginx
         install_php_packages
         configure_nginx_ssl
         install_marzhelp
         ;;
     --install-only)
+        verify_compatible_marzban
         install_marzhelp
         ;;
     *)

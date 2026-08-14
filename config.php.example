@@ -9,14 +9,14 @@ $storagePath = '/var/lib/marzhelp';
 $allowedUsers = [1088532278, 987654321];
 
 $botDbHost = 'localhost';
-$botDbUser = 'marzhelp';
+$botDbUser = 'marzhelp_app';
 $botDbPass = '';
-$botDbName = 'marzhelp';
+$botDbName = 'marzban'; // Canonical Marzban database; no separate Marzhelp DB.
 
 $vpnDbHost = ''; 
 // If you install the robot on an external host or server
 # $vpnDbPort = 3306; 
-$vpnDbUser = 'marzhelp';
+$vpnDbUser = 'marzhelp_app';
 $vpnDbPass = '';
 $vpnDbName = 'marzban';
 
